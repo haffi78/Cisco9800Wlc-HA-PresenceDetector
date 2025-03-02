@@ -88,6 +88,16 @@ def get_dot11_oper_data():
                             auth=HTTPBasicAuth(API_USER, API_PASSWORD))
     return json.loads(response.text)
 
+# Fetch mobility history data (e.g., association time, roaming details)
+def get_mobility_history():
+    _check_api_config()  # Ensure API config is set
+    url = BASE_URL + CLIENT_OPER + "/mm-if-client-history"  # Correct RESTCONF endpoint
+    headers = {"Accept": "application/yang-data+json"}
+    response = requests.get(url, headers=headers, verify=False,  # Skip SSL verification
+                            auth=HTTPBasicAuth(API_USER, API_PASSWORD))
+    return json.loads(response.text)  # Return parsed JSON response
+
+
 # Fetch client traffic statistics (e.g., bytes sent/received)
 def get_traffic_stats():
     _check_api_config()
@@ -217,7 +227,7 @@ class Cisco9800DeviceScanner(DeviceScanner):
                 if mac:  # Only store if MAC exists
                     new_results[mac] = client  # Map MAC to full client data
             self.last_results = new_results  # Update stored results
-            _LOGGER.debug("Updated client data: %s", self.last_results)
+            ## _LOGGER.debug("Updated client data: %s", self.last_results)
         except Exception as e:
             _LOGGER.error("Error updating client data: %s", e)
 
@@ -227,8 +237,93 @@ class Cisco9800DeviceScanner(DeviceScanner):
         return list(self.last_results.keys())  # Return list of detected MACs
 
     def get_extra_attributes(self, device: str) -> dict:
-        """Return additional client data for a specific device."""
-        return self.last_results.get(device, {})  # Return client data or empty dict if not found
+        """Return additional client data (Ap-name, Co-state, Username, dot11-state, and Roaming History) for a specific device."""
+        try:
+            # Fetch data from different sections
+            common_data = get_common_oper_data() or {}
+            dot11_data = get_dot11_oper_data() or {}
+            # mobility_data = get_mobility_history() or {}
+            traffic_data = get_traffic_stats() or {}
+            sisf_data = get_sisf_db_mac() or {}  # 🟢 Fetch IP information
+            dc_info_data = get_dc_info() or {}  # 🔵 Fetch device classification info
+
+            ap_data = get_ap_list() or {}
+            ap_mapping = {
+            ap.get("wtp-mac", "").lower(): ap.get("wtp-name", "Unknown AP")
+               for ap in ap_data.get("Cisco-IOS-XE-wireless-access-point-oper:ap-name-mac-map", [])
+                         }   
+
+            # Extract clients from each section
+            common_clients = common_data.get("Cisco-IOS-XE-wireless-client-oper:common-oper-data", [])
+            dot11_clients = dot11_data.get("Cisco-IOS-XE-wireless-client-oper:dot11-oper-data", [])
+            # mobility_clients = mobility_data.get("Cisco-IOS-XE-wireless-client-oper:mm-if-client-history", [])
+            traffic_clients = traffic_data.get("Cisco-IOS-XE-wireless-client-oper:traffic-stats", [])
+            sisf_clients = sisf_data.get("Cisco-IOS-XE-wireless-client-oper:sisf-db-mac", [])  # 🟢
+            dc_clients = dc_info_data.get("Cisco-IOS-XE-wireless-client-oper:dc-info", [])  # 🔵
+
+            # Find matching client in common-oper-data
+            client_info = next((client for client in common_clients if client.get("client-mac", "").lower() == device), {})
+
+            # Find matching client in dot11-oper-data
+            dot11_info = next((client for client in dot11_clients if client.get("ms-mac-address", "").lower() == device), {})
+            
+            # Find matching client in mobility history
+            # mobility_info = next((client for client in mobility_clients if client.get("client-mac", "").lower() == device), {})
+            sisf_info = next((client for client in sisf_clients if client.get("mac-addr", "").lower() == device), {})
+
+            # Find matching client in dot11-oper-data
+            traffic_info = next((client for client in traffic_clients if client.get("ms-mac-address", "").lower() == device), {})
+            
+            ipv4_address = None
+            if "ipv4-binding" in sisf_info:
+                ipv4_bindings = sisf_info.get("ipv4-binding", [])
+    
+                # Ensure it's always treated as a list
+                if isinstance(ipv4_bindings, dict):
+                    ipv4_bindings = [ipv4_bindings]  # Convert single dict to list
+
+                # Extract the first IP address found
+                if ipv4_bindings:
+                    ipv4_address = ipv4_bindings[0].get("ip-key", {}).get("ip-addr")
+        
+            # 🔵 Find matching client in dc-info (Device Classification)
+            dc_info = next((client for client in dc_clients if client.get("client-mac", "").lower() == device), {})
+
+            # Extract MAC addresses from dot11k-neighbor-list
+            raw_neighbors = dot11_info.get("dot11k-neighbor-list", {}).get("dot11k-neighbor", [])
+
+            # Normalize to always be a list
+            neighbor_macs = raw_neighbors if isinstance(raw_neighbors, list) else [raw_neighbors]
+
+            # Convert MACs to AP Names using ap_mapping
+            neighbor_ap_names = [ap_mapping.get(mac.lower(), mac) for mac in neighbor_macs]
+
+
+            # **Keep only the parent mobility-history section**
+            # mobility_history = mobility_info.get("mobility-history", {})
+
+            # Return filtered data
+            return {
+                "Access Point Name": client_info.get("ap-name"),
+                #"Client State": client_info.get("co-state"),
+                "Username": client_info.get("username"),
+                #"dot11-state": dot11_info.get("dot11-state"),
+                "SSID": dot11_info.get("vap-ssid"),
+                "Current Channel": dot11_info.get("current-channel"),
+                "dot11k-neighbor-list": neighbor_ap_names,  # List of neighboring APs
+                "ms-wifi": dot11_info.get("ms-wifi"),  # WiFi security details
+                "Connection Speed": traffic_info.get("speed"),
+                "IP Address": ipv4_address,
+                "Device Type": dc_info.get("device-type"),
+                "Device OS": dc_info.get("device-os"),
+                "Device Name": dc_info.get("device-name"),
+              
+            }
+
+        except Exception as e:
+            _LOGGER.error("Error fetching extra attributes: %s", e)
+
+        return {}  # Return empty dict if not found
 
     def get_device_name(self, device: str) -> str:
         """Return a name for the device; here, just the MAC address."""

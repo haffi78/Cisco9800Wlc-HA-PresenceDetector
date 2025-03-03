@@ -1,12 +1,10 @@
 {
     "domain": "cisco_9800_wlc",
     "name": "Cisco 9800 WLC Device Tracker",
-    "documentation": "https://haffi.is/cisco_9800_wlc",
-    "requirements": [
-      "requests>=2.27.1",
-      "xmltodict>=0.13.0"
-    ],
-    "dependencies": [],
+    "version": "1.0",
+    "documentation": "https://github.com/haffi78/Cisco9800Wlc-HA-PresenceDetector",
+    "requirements": ["ncclient","requests>=2.27.1",
+      "xmltodict>=0.13.0"],
     "codeowners": ["@haffi78"],
-    "version": "1.0.0"
-  }
+    "config_flow": true
+}

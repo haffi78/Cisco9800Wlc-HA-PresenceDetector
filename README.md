@@ -1,66 +1,68 @@
-Cisco 9800 WLC Home Assistant Integration
+# Cisco 9800 WLC Device Tracker
 
-Overview:
-This is a custom Home Assistant integration to track devices connected to a Cisco 9800 Wireless LAN Controller (WLC) using RESTCONF API. It retrieves client operational data and updates Home Assistant's device_tracker component.
+![Cisco 9800 WLC](icons/logo.png)
 
-Features:
-- Tracks clients connected to the Cisco 9800 WLC.
-- Uses RESTCONF API for data retrieval.
-- Supports secure authentication with username and password.
-- Configurable scan interval for periodic updates.
-- SSL verification can be enabled or disabled.
+## 📌 Overview
 
-Installation:
-1. Create the Custom Component Directory:
-   - Navigate to Home Assistant config directory and create:
-     /config/custom_components/cisco_9800_wlc/
-   - Copy device_tracker.py into this folder.
+The **Cisco 9800 WLC Device Tracker** is a **Home Assistant** custom integration that tracks devices connected to a **Cisco 9800 Wireless LAN Controller (WLC)**. This integration retrieves connection details using the **RESTCONF API** and updates Home Assistant entities.
 
-2. Configure configuration.yaml:
-   - Add the following section to configuration.yaml:
-   
-     device_tracker:
-       - platform: cisco_9800_wlc
-         host: 192.168.10.6
-         username: admin
-         password: XXXXXXX
-         verify_ssl: false
-         new_device_defaults:
-           track_new_devices: false
+## ✨ Features
 
-3. Restart Home Assistant:
-   - Restart Home Assistant with: ha core restart
+✔️ **Track connected devices** on your Cisco 9800 WLC.  
+✔️ **UI-based setup** – No YAML needed.  
+✔️ **Local polling** – No cloud dependencies.  
+✔️ **SSL Support** – Ignore self-signed SSL certificates if needed.  
+✔️ **Options for auto-disabling new devices**.  
 
-Configuration Options:
-- host (Required): IP or hostname of the Cisco 9800 WLC.
-- username (Required): Username for RESTCONF API authentication.
-- password (Required): Password for RESTCONF API authentication.
-- verify_ssl (Optional): Set to false for self-signed certificates (default: false).
-- scan_interval (Optional): Interval (in seconds) between API calls (default: 30).
-- new_device_defaults.track_new_devices (Optional): Determines if new devices are tracked by default (default: false).
+## 🚀 Installation Guide
 
-How It Works:
-- Connects to the Cisco 9800 WLC using the RESTCONF API.
-- Retrieves client operational data (MAC addresses, connection status).
-- Updates Home Assistant periodically based on scan_interval.
+### **Manual Installation**
+1. Download the latest release from [GitHub](https://github.com/haffi78/Cisco9800Wlc-HA-PresenceDetector).
+2. Copy the `cisco_9800_wlc` folder to your **Home Assistant custom_components directory**:
+   ```sh
+   /config/custom_components/cisco_9800_wlc
+   ```
+3. Restart Home Assistant.
 
-Troubleshooting:
-- Home Assistant fails to start: Ensure custom_components/cisco_9800_wlc folder and device_tracker.py are present.
-- No devices detected: Verify WLC IP, username, password, and ensure RESTCONF is enabled.
-- SSL certificate errors: Set verify_ssl: false in configuration.yaml for self-signed certificates.
+### **Installation via HACS (Recommended)**
+1. Open **HACS** in Home Assistant.
+2. Go to **Integrations** → **+ Explore & Add Repositories**.
+3. Add this repository (`https://github.com/haffi78/Cisco9800Wlc-HA-PresenceDetector`) as an **Integration**.
+4. Install and restart Home Assistant.
 
-Note: Don't forget to configure WLC 9800 to enable RESTCONF and adjust access list if needed.
+## 🛠️ Configuration Steps
 
-Future Enhancements:
-- Support for more detailed client info.
-- Additional filtering configuration options.
-- Enhanced logging and debugging.
+1. Go to **Settings** → **Devices & Services** → **Add Integration**.
+2. Search for **Cisco 9800 WLC** and select it.
+3. Enter the required details:
+   - 🏠 **WLC IP Address**
+   - 👤 **Username**
+   - 🔑 **Password**
+   - 🔒 **SSL Verification** (Optional)
+4. Click **Submit**.
 
-License:
-This project is open-source and available under the MIT License.
+### ⚙️ Available Options
+- **Disable newly discovered devices**: Prevents new entities from being added automatically.
 
-Contributions:
-Pull requests and feature suggestions are welcome! Submit issues or enhancements via GitHub.
+## 🔍 Troubleshooting
 
-Author:
-Hafþór Hilmarsson O'Connor
+| Issue | Solution |
+|-------|----------|
+| ❌ Unable to connect | Ensure RESTCONF is enabled and credentials are correct. |
+| ❌ Invalid authentication | Verify username and password. |
+| ⚠️ SSL verification failed | Enable "Ignore Self-Signed SSL" during setup. |
+| ❓ Unknown error | Check Home Assistant logs for details. |
+
+## 📜 License
+
+This project is licensed under the **MIT License**.
+
+---
+
+### 🎯 **Want a Better Webpage? Use GitHub Pages**
+If you want to **turn this into a GitHub Pages site**, create a **`docs/`** folder in your repository and move the `README.md` file inside it. Then:
+- Enable **GitHub Pages** in the repository settings.
+- Select the `docs/` folder as the source.
+- GitHub will generate a webpage at:  
+  `https://yourusername.github.io/yourrepository/`
+

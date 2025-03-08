@@ -13,6 +13,9 @@ The **Cisco 9800 WLC Device Tracker** is a **Home Assistant** custom integration
 ✔️ **Local polling** – No cloud dependencies.  
 ✔️ **SSL Support** – Ignore self-signed SSL certificates if needed.  
 ✔️ **Options for auto-disabling new devices**.  
+✔️ **Wifi clients start disabled to avoid over pulling
+✔️ System pulls wifi connected clients, get mac and ip address, then looks up enabled devices from home and pulls extra attributes.
+
 
 ## 🚀 Installation Guide
 
@@ -48,21 +51,11 @@ The **Cisco 9800 WLC Device Tracker** is a **Home Assistant** custom integration
 
 | Issue | Solution |
 |-------|----------|
-| ❌ Unable to connect | Ensure RESTCONF is enabled and credentials are correct. |
-| ❌ Invalid authentication | Verify username and password. |
-| ⚠️ SSL verification failed | Enable "Ignore Self-Signed SSL" during setup. |
-| ❓ Unknown error | Check Home Assistant logs for details. |
+
 
 ## 📜 License
 
 This project is licensed under the **MIT License**.
 
 ---
-
-### 🎯 **Want a Better Webpage? Use GitHub Pages**
-If you want to **turn this into a GitHub Pages site**, create a **`docs/`** folder in your repository and move the `README.md` file inside it. Then:
-- Enable **GitHub Pages** in the repository settings.
-- Select the `docs/` folder as the source.
-- GitHub will generate a webpage at:  
-  `https://yourusername.github.io/yourrepository/`
 

@@ -1,10 +1,10 @@
 {
-    "domain": "cisco_9800_wlc",
-    "name": "Cisco 9800 WLC Device Tracker",
-    "version": "1.0",
-    "documentation": "https://github.com/haffi78/Cisco9800Wlc-HA-PresenceDetector",
-    "requirements": ["ncclient","requests>=2.27.1",
-      "xmltodict>=0.13.0"],
-    "codeowners": ["@haffi78"],
-    "config_flow": true
-}
+  "domain": "cisco_9800_wlc",
+  "name": "Cisco 9800 WLC Device Tracker",
+  "version": "1.0",
+  "documentation": "https://github.com/haffi78/Cisco9800Wlc-HA-PresenceDetector",
+  "requirements": ["aiohttp"],
+  "codeowners": ["@haffi78"],
+  "config_flow": true,
+  "iot_class": "local_polling"
+ }

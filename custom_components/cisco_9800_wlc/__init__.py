@@ -3,6 +3,7 @@ import logging
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
+from .coordinator import CiscoWLCUpdateCoordinator
 
 DOMAIN = "cisco_9800_wlc"
 PLATFORMS = [Platform.DEVICE_TRACKER]
@@ -19,9 +20,23 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     return True
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    _LOGGER.info("Setting up Cisco 9800 WLC entry")
+    _LOGGER.info(f"Setting up Cisco 9800 WLC entry {entry.entry_id}")
+
+    # Ensure DOMAIN storage exists
     hass.data.setdefault(DOMAIN, {})
+
+    # Create the coordinator
+    coordinator = CiscoWLCUpdateCoordinator(hass, entry.data)
+
+    # Fetch initial data
+    await coordinator.async_config_entry_first_refresh()
+
+    # Store the coordinator in Home Assistant's data
+    hass.data[DOMAIN][entry.entry_id] = coordinator
+
+    # Forward the setup to platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

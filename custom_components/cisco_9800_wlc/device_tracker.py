@@ -9,6 +9,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import device_registry as dr
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from datetime import datetime
 from .const import  DEFAULT_TRACK_NEW ,DOMAIN  
 
 _LOGGER = logging.getLogger(__name__)
@@ -88,6 +89,7 @@ class CiscoWLCStatus(CoordinatorEntity):
     
 # -------------------------
 #  Tracked Client Entity
+# Lets remeber that WLC has a idle timeout so clients will report in even when disconnected for the idle time. default 6 mins.
 # -------------------------
 class CiscoWLCClient(ScannerEntity, CoordinatorEntity):
     """Represents a tracked client device connected to the Cisco WLC."""
@@ -101,7 +103,8 @@ class CiscoWLCClient(ScannerEntity, CoordinatorEntity):
         self.data = self.coordinator.data.get(self.mac, {})
         self._attr_should_poll = False  #  Polling is not needed
         self._enable_by_default = enable_by_default  #  Store user preference
-        
+      
+
     @property
     def source_type(self):
         """Indicate this is a router-based tracker."""
@@ -119,13 +122,14 @@ class CiscoWLCClient(ScannerEntity, CoordinatorEntity):
 
     @property
     def name(self):
-        """Return the device name if available, otherwise the MAC address."""
-        return self.data.get("device_name") or self.mac  #  Optimized fallback
+        """Return the device name from extra_state_attributes, otherwise the MAC address."""
+        attributes = self.extra_state_attributes  # Ensure we're getting the latest attributes
+        return attributes.get("Device Name", self.mac)  #  Now correctly retrieves the name
 
     @property
     def is_connected(self) -> bool:
-        """Return True if the client is still connected and has valid attributes."""
-        return bool(self.coordinator.data.get(self.mac))  #  More robust check
+        """Return True if the client is still connected."""
+        return self.mac in self.coordinator.data
 
     @property
     def extra_state_attributes(self):
@@ -151,6 +155,8 @@ class CiscoWLCClient(ScannerEntity, CoordinatorEntity):
             "Previous Roam 3": None, 
             "IP Address": None,
             "WifiStandard": None,
+            "Last Updated Time": None 
+            
 
             
         }
@@ -172,6 +178,7 @@ class CiscoWLCClient(ScannerEntity, CoordinatorEntity):
             "Previous Roam 3": "previous_roam_3",   
             "WifiStandard": "WifiStandard",
             "Username": "username",
+            "Last Updated Time": "last_updated_time"
         }
 
         merged_attributes = {}
@@ -248,7 +255,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
     #  Step 5: Register **all** clients in Home Assistant
     clients = [
     CiscoWLCClient(coordinator, mac, coordinator.data.get(mac, {}), enable_new_entities)
-    for mac in all_clients  # 🔥 Add all discovered clients
+    for mac in all_clients  #  Add all discovered clients
 ]
 
     if clients:
@@ -258,3 +265,4 @@ async def async_setup_entry(hass, entry, async_add_entities):
         _LOGGER.warning(" No client entities were added. Check if WLC data retrieval is working.")
 
     _LOGGER.info(" Cisco 9800 WLC setup completed successfully!")
+

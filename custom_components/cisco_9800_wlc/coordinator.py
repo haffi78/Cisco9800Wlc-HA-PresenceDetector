@@ -3,12 +3,12 @@ import json
 import logging
 import aiohttp
 import asyncio
-import datetime  
 import locale
 import re
 from urllib.parse import quote
 import xml.etree.ElementTree as ET
 from datetime import timedelta
+from datetime import datetime
 from .const import DEFAULT_TRACK_NEW ,DOMAIN  
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -38,17 +38,16 @@ def format_roaming_time(timestamp):
     - Output: "22:04:19 - 12 March"
     """
     try:
-        # ✅ Convert to datetime object
-        dt = datetime.datetime.fromisoformat(timestamp)
+        #  Convert to datetime object
+        dt = datetime.fromisoformat(timestamp)
 
-        # ✅ Set locale for month name translation (adjust based on language)
+        #  Set locale for month name translation (adjust based on language)
         locale.setlocale(locale.LC_TIME, "en_US.UTF-8")  # Change as needed ("sv_SE.UTF-8" for Swedish)
 
-        # ✅ Format: "22:04:19 - 12 March"
+        #  Format: "22:04:19 - 12 March"
         return dt.strftime("%H:%M:%S - %d %B")
 
     except ValueError:
-        # ❌ If parsing fails, return the original timestamp
         return timestamp
 
 class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
@@ -69,7 +68,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         self.session = async_get_clientsession(hass, verify_ssl=self.verify_ssl)
         self.api_semaphore = asyncio.Semaphore(5)  # Limit concurrent API requests to 5
 
-        # ✅ Store authentication **once** in `self.auth`
+        #  Store authentication **once** in `self.auth`
         self.auth = aiohttp.BasicAuth(self.username, self.password)
 
         hass.loop.create_task(self.delayed_first_scan())
@@ -100,55 +99,42 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             url = f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/sisf-db-mac"
             headers = {"Accept": "application/yang-data+json"}
 
-            # ✅ Reuse `self.auth` instead of creating a new one
             async with self.session.get(url, headers=headers, auth=self.auth) as response:
-                            
                 response_text = await response.text()
 
-                if response.status == 409:  #  API Overload (Too many sessions)
-                    _LOGGER.warning(" WLC API Overload (Too many sessions). Skipping this update cycle.")
-                    return self.data  #  Return existing data, avoid erasing clients
+                if response.status == 409:  # API Overload (Too many sessions)
+                    _LOGGER.warning("WLC API Overload (Too many sessions). Skipping this update cycle.")
+                    return self.coordinator.data  #  Return existing data to avoid overwriting
 
                 if response.status != 200:
-                    _LOGGER.error(f" HTTP {response.status}: Error fetching client list - {response_text}")
+                    _LOGGER.error(f"HTTP {response.status}: Error fetching client list - {response_text}")
                     raise UpdateFailed(f"HTTP {response.status}: {response_text}")
 
                 try:
-                    
                     data = await response.json()
-                    
-    
                 except Exception as json_err:
-                    _LOGGER.error(f" JSON Parsing Error: {json_err} - Response: {response_text}")
+                    _LOGGER.error(f"JSON Parsing Error: {json_err} - Response: {response_text}")
                     raise UpdateFailed("JSON Parsing Error")
 
-            #  Get full list of connected clients
+            #  Get the list of currently active clients (only those in the WLC response)
             clients = data.get("Cisco-IOS-XE-wireless-client-oper:sisf-db-mac", [])
             if not isinstance(clients, list):
-                _LOGGER.error(f" Unexpected response format from WLC: {data}")
+                _LOGGER.error(f"Unexpected response format from WLC: {data}")
                 raise UpdateFailed("Unexpected response format from WLC")
 
-            #  Retrieve only enabled/tracked devices from HA
-            tracked_macs = self.get_tracked_macs()  #  Get only actively tracked entities
-            tracked_macs = {mac for mac in tracked_macs if any(client.get("mac-addr", "").lower() == mac for client in clients)}
+            #  Get currently tracked MACs (from HA)
+            tracked_macs = self.get_tracked_macs()
 
-            #_LOGGER.debug(f" Home Assistant is tracking these Normal only enabled devices: {tracked_macs}")
+            #  Extract MACs seen in the latest WLC scan
+            active_macs = {client.get("mac-addr", "").lower() for client in clients if client.get("mac-addr")}
 
-            #  Store IPv4 for all clients **without overwriting existing attributes**
-            client_data = self.data.copy()  #  Start with previous data to preserve existing attributes
+            #  Find MACs that are both tracked and currently active
+            tracked_and_active_macs = tracked_macs & active_macs  # Intersection of both sets
+
+            #  Prepare updated client data (ALL active MACs get at least their IP)
+            client_data = {}
 
             for client in clients:
-                
-                
-                mac = client.get("mac-addr", "").lower()
-                if not mac:
-                    continue  # Skip invalid MACs
-
-                # Extract and store IPv4 address
-                ipv4_address = client.get("ipv4-binding", {}).get("ip-key", {}).get("ip-addr", "N/A")
-
-                
-             
                 mac = client.get("mac-addr", "").lower()
                 if not mac:
                     continue  # Skip invalid MACs
@@ -157,52 +143,44 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 ip_entry = client.get("ipv4-binding", {}).get("ip-key", {})
                 ipv4_address = ip_entry.get("ip-addr", "N/A")
 
-                if mac not in client_data:
-                    client_data[mac] = {}  #  Ensure key exists for new clients
-                
-               # _LOGGER.debug(" Processed Client Data right before : %s", self.data)
-                #  Store or update IPv4 address **without overwriting other attributes**
-                client_data[mac]["IP Address"] = ipv4_address
+                #  Store ALL active MACs with basic data
+                client_data[mac] = {"IP Address": ipv4_address}
 
-            #  Fetch additional attributes only for **tracked MACs**
-           
-
-            tasks = [self.fetch_attributes(mac) for mac in tracked_macs if mac in client_data]
-
+            #  Fetch attributes only for tracked & active MACs
+            tasks = [self.fetch_attributes(mac) for mac in tracked_and_active_macs]
 
             attribute_results = []
-            for i in range(0, len(tasks), 5):  # Process in batches of 5 (adjustable)
+            for i in range(0, len(tasks), 5):  # Process in batches of 5
                 batch = tasks[i:i+5]
-                batch_results = await asyncio.gather(*batch, return_exceptions=True)  #  Await and store results
-                attribute_results.extend(batch_results)  #  Append results to the final list
-                await asyncio.sleep(0.1)  #  Add small delay only after each batch
+                batch_results = await asyncio.gather(*batch, return_exceptions=True)  # Await and store results
+                attribute_results.extend(batch_results)
+                await asyncio.sleep(0.1)  # Add small delay after each batch
 
-            #  Now merge attributes without overwriting existing data
-            for mac, attributes in zip(tracked_macs, attribute_results):
+            #  Merge attributes into the final client_data (only for tracked MACs)
+            for mac, attributes in zip(tracked_and_active_macs, attribute_results):
                 if isinstance(attributes, dict) and attributes:
-                   # _LOGGER.debug(f" Merging attributes for {mac}: {attributes}")
-
-                    #  Only update non-empty values (avoids overwriting good data)
                     for key, value in attributes.items():
-                        if value not in [None, ""]:  #  Keep existing data if the new value is empty
+                        if value not in [None, ""]:  # ✅ Only update non-empty values
                             client_data[mac][key] = value
-
                 elif isinstance(attributes, Exception):
-                    _LOGGER.error(f" Error fetching attributes for {mac}: {attributes}")
+                    _LOGGER.error(f"Error fetching attributes for {mac}: {attributes}")
                 else:
-                    _LOGGER.warning(f" Skipping empty attributes for {mac}")
+                    _LOGGER.warning(f"Skipping empty attributes for {mac}")
 
-            #  Ensure HA gets the updated data (preserving previous data)
- 
-          #  _LOGGER.debug(f" [COORDINATOR] Final processed client data before updating HA: {client_data}")  # NEW DEBUG LOG
+            #  Log final processed data before sending to HA
+            # _LOGGER.debug(f"Final Processed Client Data (All Active MACs Sent to HA, Extra for Tracked): {client_data}")
+
+            #  Send ALL active MACs (basic data for all, enriched for tracked)
+            self.async_set_updated_data(client_data)  # Ensure HA gets updates!
+
             return client_data
 
         except UpdateFailed as update_err:
-            _LOGGER.error(f" UpdateFailed Error: {update_err}")
+            _LOGGER.error(f"UpdateFailed Error: {update_err}")
             raise
 
         except Exception as err:
-            _LOGGER.warning(f" Unexpected error fetching WLC data: {str(err)}")
+            _LOGGER.warning(f"Unexpected error fetching WLC data: {str(err)}")
             raise UpdateFailed(f"Unexpected error: {str(err)}")
 
 ############################################################################################################
@@ -295,7 +273,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 if normalized_mac:
                     tracked_macs.add(normalized_mac)
                
-
+            _LOGGER.debug(f"This is the tracked macs {tracked_macs}")
         return tracked_macs
 ############################################################################################################
 
@@ -304,15 +282,15 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
         async with self.api_semaphore:  # Prevents API flooding (Max concurrent requests)
             encoded_mac = quote(mac, safe="")  # Properly encode the MAC address
-            attributes = self.data.get(mac, {}).copy()  # ✅ Keep previous attributes across runs
-
-            # ✅ Check if `dc-info` has already been fetched for this MAC
+            attributes = {}
+            attributes["last_updated_time"] = datetime.now().strftime("%H:%M:%S")
+            #  Check if `dc-info` has already been fetched for this MAC
             has_dc_info = all(
                 attributes.get(attr) not in [None, "", "Unknown", "N/A"]
                 for attr in ["device-name", "device-type", "device-os"]
             )
-
-            # ✅ Define API calls (fetch everything except `dc-info` if already known)
+            
+            #  Define API calls (fetch everything except `dc-info` if already known)
             url_mapping = {
                 "common": f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/common-oper-data={encoded_mac}",
                 "dot11": f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/dot11-oper-data={encoded_mac}",
@@ -320,22 +298,22 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 "roaming_history": f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/mm-if-client-history={encoded_mac}/mobility-history",
             }
 
-            # ✅ Only fetch `dc-info` if it hasn’t been retrieved before
+            #  Only fetch `dc-info` if it hasn’t been retrieved before
             if not has_dc_info:
                 url_mapping["device"] = f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/dc-info={encoded_mac}"
 
             headers = {"Accept": "application/yang-data+json"}
            
 
-            await asyncio.sleep(0.1)  # ✅ Small delay to avoid API rate limits
+            await asyncio.sleep(0.1)  #  Small delay to avoid API rate limits
 
-            # ✅ Fetch API data asynchronously
+            #  Fetch API data asynchronously
             tasks = {key: self.session.get(url, headers=headers, auth=self.auth) for key, url in url_mapping.items()}
             responses = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
             is_wireless = False  # Default assumption
 
-            # ✅ Process API responses
+            #  Process API responses
             for (key, response) in zip(tasks.keys(), responses):
                 if isinstance(response, Exception):
                     _LOGGER.error(f"fetch_attributes: Request failed for {key} ({mac}): {response}")
@@ -346,7 +324,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
                     if response.status == 409:  # API Overload
                         _LOGGER.warning(f"WLC API Overload (Too many sessions): Skipping {mac}.")
-                        return self.data.get(mac, {})  # ✅ Keep existing data, avoid overwriting
+                        return self.data.get(mac, {})  #  Keep existing data, avoid overwriting
 
                     if response.status == 404:
                         continue
@@ -358,40 +336,42 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     items = data[root_key]
 
                     if isinstance(items, list) and len(items) > 0:
-                        items = items[0]  # ✅ Extract first item from list
+                        items = items[0]  #  Extract first item from list
 
                     if key == "speed" and isinstance(items, int):
                         attributes["speed"] = items
-                        continue  # ✅ Speed is just an integer, no further processing needed
+                        
+                        continue  #  Speed is just an integer, no further processing needed
 
                     if not isinstance(items, dict):
                         continue
 
-                    # ✅ Process `common` attributes (Determining if WiFi or wired)
+                    #  Process `common` attributes (Determining if WiFi or wired)
                     if key == "common":
                         attributes["ap-name"] = items.get("ap-name", "Wired Connection" if "ap-name" not in items else items["ap-name"])
                         attributes["username"] = items.get("username", None)
-                        is_wireless = bool(attributes["ap-name"])  # ✅ True if AP name exists
+                        is_wireless = bool(attributes["ap-name"])  #  True if AP name exists
+                        
 
-                    # ✅ Process `dot11` attributes
+                    #  Process `dot11` attributes
                     elif key == "dot11":
                         attributes["current-channel"] = items.get("current-channel", None if is_wireless else None)
                         attributes["auth-key-mgmt"] = items.get("ms-wifi", {}).get("auth-key-mgmt", None)
                         attributes["ssid"] = items.get("vap-ssid", None)
                         attributes["WifiStandard"] = items.get("ewlc-ms-phy-type", "Unknown")
 
-                    # ✅ Process `dc-info` (Only fetched if missing in `self.data`)
+                    #  Process `dc-info` (Only fetched if missing in `self.data`)
                     elif key == "device":
                         attributes["device-name"] = items.get("device-name", None)
                         attributes["device-type"] = items.get("device-type", None)
                         attributes["device-os"] = items.get("device-os", None)
 
-                    # ✅ Process `roaming_history`
+                    #  Process `roaming_history`
                     elif key == "roaming_history":
                         mobility_entries = items.get("entry", [])
 
                         if isinstance(mobility_entries, list):
-                            # ✅ Ensure entries are sorted correctly (most recent first)
+                            #  Ensure entries are sorted correctly (most recent first)
                             mobility_entries.sort(key=lambda x: x.get("ms-assoc-time", 0), reverse=True)
 
                             formatted_roaming = []
@@ -399,12 +379,12 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                                 ap_name = entry.get("ap-name", "Unknown AP")
                                 raw_time = entry.get("ms-assoc-time", "")
 
-                                # ✅ Use the helper function to format the time
+                                #  Use the helper function to format the time
                                 formatted_time = format_roaming_time(raw_time)
 
                                 formatted_roaming.append(f"Roamed: {ap_name} at {formatted_time}")
 
-                            # ✅ Assign formatted timestamps
+                            #  Assign formatted timestamps
                             if formatted_roaming:
                                 attributes["most_recent_roam"] = formatted_roaming[0] if len(formatted_roaming) > 0 else None
                                 attributes["previous_roam_1"] = formatted_roaming[1] if len(formatted_roaming) > 1 else None
@@ -413,8 +393,8 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
                 except Exception as err:
                     _LOGGER.error(f"Error processing {key} attributes for MAC {mac}: {err}")
-
-            # ✅ **Persist the fetched attributes in `self.data` to keep across update cycles**
+            
+            #  **Persist the fetched attributes in `self.data` to keep across update cycles**
             self.data[mac] = attributes
 
             return attributes

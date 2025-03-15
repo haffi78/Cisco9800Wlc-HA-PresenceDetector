@@ -54,9 +54,15 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
     """Coordinator to manage Cisco 9800 WLC API polling."""
 
     def __init__(self, hass: HomeAssistant, config: dict):
+        polling_enabled = not hass.data[DOMAIN].get(config.get("entry_id", ""), {}).get("options", {}).get("disable_polling", False)
         super().__init__(
-            hass, _LOGGER, name=DOMAIN, update_interval=SCAN_INTERVAL
+            hass, _LOGGER, name=DOMAIN, update_interval=SCAN_INTERVAL if polling_enabled else None
         )
+
+        if not polling_enabled:
+            _LOGGER.info("Polling is disabled in system options. Updates will only occur manually.")
+        else:
+            _LOGGER.info(f" Polling is enabled. Update interval: {SCAN_INTERVAL}")
         self.hass = hass
         self.host = config[CONF_HOST]
         self.username = config[CONF_USERNAME]
@@ -84,9 +90,15 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
 
     async def delayed_first_scan(self):
-        """Wait a short time after startup, then run the first full scan."""
-    
-        await asyncio.sleep(2)  # Wait 10 seconds after HA starts
+        """Wait a short time after startup, then run the first full scan, but only if polling is enabled."""
+        await asyncio.sleep(2)  # Short delay after startup
+
+        # ✅ Prevent immediate duplicate calls if polling is already scheduled
+        if self.config_entry.options.get("disable_polling", False):
+            _LOGGER.debug("Polling is disabled. Skipping delayed first scan.")
+            return
+
+        _LOGGER.debug("Starting delayed first scan.")
         await self._async_update_data()  # Now do the first full scan
    
 
@@ -94,6 +106,11 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self):
         """Fetch all connected clients from Cisco WLC but only update tracked entities."""
+
+        if self.config_entry.options.get("disable_polling", False):
+            _LOGGER.info(" Polling is disabled via options. Skipping automatic update.")
+            return self.data
+                 
 
         try:
             url = f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/sisf-db-mac"
@@ -127,8 +144,9 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
             #  Extract MACs seen in the latest WLC scan
             active_macs = {client.get("mac-addr", "").lower() for client in clients if client.get("mac-addr")}
-
-            #  Find MACs that are both tracked and currently active
+            _LOGGER.debug(f" Active MAC addresses from WLC: {', '.join(active_macs)}") 
+           
+             #  Find MACs that are both tracked and currently active
             tracked_and_active_macs = tracked_macs & active_macs  # Intersection of both sets
 
             #  Prepare updated client data (ALL active MACs get at least their IP)
@@ -273,7 +291,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 if normalized_mac:
                     tracked_macs.add(normalized_mac)
                
-            _LOGGER.debug(f"This is the tracked macs {tracked_macs}")
+           # _LOGGER.debug(f"This is the tracked macs {tracked_macs}")
         return tracked_macs
 ############################################################################################################
 

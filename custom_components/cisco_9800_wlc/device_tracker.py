@@ -9,7 +9,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import device_registry as dr
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from datetime import datetime
+from datetime import datetime, timedelta
 from .const import  DEFAULT_TRACK_NEW ,DOMAIN  
 
 _LOGGER = logging.getLogger(__name__)
@@ -193,12 +193,30 @@ class CiscoWLCClient(ScannerEntity, CoordinatorEntity):
         return merged_attributes
             
     async def async_update(self):
-        """Fetch the latest list of connected clients."""
-    # _LOGGER.debug(" CiscoWLCClient - 9800 Fetching connected client data")
-        # Ask coordinator to refresh ALL clients
+        """Fetch the latest list of connected clients and update state."""
+
+        _LOGGER.debug(f"Tracker - Checking entity {self.entity_id} (MAC: {self.mac})")
+
+        #  Handle "Unavailable" State Before Fetching Data
+        current_state = self.hass.states.get(self.entity_id)
+        if current_state and current_state.state == "unavailable":
+            _LOGGER.info(f" Restoring entity {self.entity_id} from 'unavailable' to 'away'")
+            self.hass.states.async_set(self.entity_id, "away")
+
+        # Refresh coordinator data
         await self.coordinator.async_request_refresh()
-    
-        # Ensure HA updates UI
+
+        client_data = self.coordinator.data.get(self.mac)
+
+        if client_data:
+            #  If the MAC is detected, mark as home
+            self._attr_is_connected = True
+            self._attr_state = "home"
+        else:
+            #  If MAC is missing, mark as away
+            self._attr_is_connected = False
+            self._attr_state = "away"
+
         self.async_write_ha_state()
 
 # -------------------------
@@ -209,60 +227,90 @@ async def async_setup_entry(hass, entry, async_add_entities):
     """Set up Cisco 9800 WLC device tracker from a config entry."""
     _LOGGER.info(" Starting setup for Cisco 9800 WLC integration.")
 
-    #  Get the WLC data coordinator
     coordinator = hass.data[DOMAIN].get(entry.entry_id)
+    if entry.options.get("disable_polling", False):
+        _LOGGER.info("Polling is disabled in system options. Using manual refresh only.")
+        coordinator.update_interval = None  # Disable automatic updates
+    else:
+        _LOGGER.info("Polling is enabled. Setting update interval.")
+        coordinator.update_interval = timedelta(seconds=120)  # Keep existing interval
     
     if not coordinator:
         _LOGGER.error(" Failed to find WLC coordinator for entry %s. Aborting setup.", entry.entry_id)
-        return  #  Stop setup if the coordinator is missing
+        return
+
     enable_new_entities = entry.options.get("enable_new_entities", False)
-    await coordinator.fetch_wlc_status()  #  Get WLC online status + firmware version
-    
-    #  Step 2:  Create WLC status entity **before fetching clients
-        
+    await coordinator.fetch_wlc_status()
+
     wlc_status_entity = CiscoWLCStatus(
-    coordinator,
-    entry,
-    wlc_online_status=coordinator.data.get("wlc_status", {}).get("online_status", "Offline"),
-    wlc_software_version=coordinator.data.get("wlc_status", {}).get("software_version", "n/a")
-)
-    
+        coordinator,
+        entry,
+        wlc_online_status=coordinator.data.get("wlc_status", {}).get("online_status", "Offline"),
+        wlc_software_version=coordinator.data.get("wlc_status", {}).get("software_version", "n/a")
+    )
 
-
-    async_add_entities([wlc_status_entity])  #  Register WLC status entity
-    
-    #  Store reference for future updates
+    async_add_entities([wlc_status_entity])
     hass.data[DOMAIN]["wlc_status_entity"] = wlc_status_entity 
-    wlc_status_entity.async_write_ha_state() #  Ensure HA UI reflects WLC status immediately
+    wlc_status_entity.async_write_ha_state()
    
-    #  Step 3: Check if WLC is online before proceeding   
     if wlc_status_entity._attr_online_status != "Online":
         _LOGGER.error(" WLC is offline! Aborting client setup but keeping status entity.")
-        return  #  Stop client setup but keep WLC status visible in HA
+        return
 
     _LOGGER.info(" WLC is online! Proceeding with client setup.")
 
-    #  Step 4: Fetch **all** clients (before tracking specific ones)
+    # Fetch initial list of clients from WLC
     _LOGGER.info(" Fetching initial client list from WLC...")
-    await coordinator._async_update_data()  #  Retrieve all connected clients
+    await coordinator._async_update_data()
+    all_active_clients = set(coordinator.data.keys())
 
-    # Get the list of all clients detected by the WLC
-    all_clients = list(coordinator.data.keys())
+    #  **Step 1: Retrieve all known devices from Home Assistant**
+    entity_registry = er.async_get(hass)
+    known_clients = set()
 
-    if not all_clients:
-        _LOGGER.warning(" No clients found on the WLC. Device tracker might not work properly.")
+    for entity_entry in entity_registry.entities.values():
+        if (
+            entity_entry.platform == DOMAIN
+            and entity_entry.entity_id.startswith("device_tracker.cisco_9800_wlc_")
+            and entity_entry.disabled_by is None
+        ):
+            known_clients.add(entity_entry.unique_id.lower())
 
-    #  Step 5: Register **all** clients in Home Assistant
-    clients = [
-    CiscoWLCClient(coordinator, mac, coordinator.data.get(mac, {}), enable_new_entities)
-    for mac in all_clients  #  Add all discovered clients
-]
+    _LOGGER.info(f" Home Assistant knows {len(known_clients)} devices.")
+    _LOGGER.info(f" WLC currently sees {len(all_active_clients)} devices.")
 
-    if clients:
-        _LOGGER.info(f" Registering {len(clients)} client trackers in Home Assistant.")
-        async_add_entities(clients)  #  Add all clients as HA entities
+    # **Step 2: Merge Known Clients & Active Clients**
+    all_clients = known_clients | all_active_clients  # Union of both sets
+
+    # **Step 3: Register All Clients in Home Assistant**
+    clients_to_add = [
+        CiscoWLCClient(coordinator, mac, coordinator.data.get(mac, {}), enable_new_entities)
+        for mac in all_clients
+    ]
+
+    if clients_to_add:
+        _LOGGER.info(f"Registering {len(clients_to_add)} device trackers in Home Assistant.")
+        async_add_entities(clients_to_add)
     else:
         _LOGGER.warning(" No client entities were added. Check if WLC data retrieval is working.")
 
-    _LOGGER.info(" Cisco 9800 WLC setup completed successfully!")
+    # **Step 4: Handle "RESTORED" entities stuck as 'unavailable'**
+    restored_entities = []
+    for entity_entry in entity_registry.entities.values():
+        if (
+            entity_entry.platform == DOMAIN
+            and entity_entry.entity_id.startswith("device_tracker.cisco_9800_wlc_")
+            and entity_entry.disabled_by is None
+        ):
+            current_state = hass.states.get(entity_entry.entity_id)
 
+            #  If device is "restored" but missing from the API, re-register it
+            if entity_entry.entity_id not in coordinator.data:
+                hass.states.async_set(entity_entry.entity_id, "away")
+                restored_entities.append(entity_entry.entity_id)
+
+    if restored_entities:
+        _LOGGER.info(f"🚀 Manually refreshing {len(restored_entities)} restored entities to sync attributes.")
+        hass.async_create_task(coordinator.async_request_refresh())  #  Ensure attributes update
+
+    _LOGGER.info("Cisco 9800 WLC setup completed successfully!")

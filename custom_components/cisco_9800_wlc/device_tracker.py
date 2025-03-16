@@ -238,8 +238,11 @@ async def async_setup_entry(hass, entry, async_add_entities):
     if not coordinator:
         _LOGGER.error(" Failed to find WLC coordinator for entry %s. Aborting setup.", entry.entry_id)
         return
-
+    
+    hass.data[DOMAIN]["async_add_entities"] = async_add_entities
+    coordinator.async_add_entities = async_add_entities
     enable_new_entities = entry.options.get("enable_new_entities", False)
+    
     await coordinator.fetch_wlc_status()
 
     wlc_status_entity = CiscoWLCStatus(
@@ -261,7 +264,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
     # Fetch initial list of clients from WLC
     _LOGGER.info(" Fetching initial client list from WLC...")
-    await coordinator._async_update_data()
+    await coordinator._async_firstrun()
     all_active_clients = set(coordinator.data.keys())
 
     #  **Step 1: Retrieve all known devices from Home Assistant**

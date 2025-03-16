@@ -16,7 +16,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.const import CONF_HOST, CONF_USERNAME, CONF_PASSWORD, CONF_VERIFY_SSL
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_registry import RegistryEntryDisabler
-
+from .device_tracker import CiscoWLCClient
 
 _LOGGER = logging.getLogger(__name__)
 SCAN_INTERVAL = timedelta(seconds=120)
@@ -104,6 +104,70 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
 ############################################################################################################
 
+    async def _async_firstrun(self):
+        """Fetch all connected clients from Cisco WLC but only update tracked entities."""
+
+        if self.config_entry.options.get("disable_polling", False):
+            _LOGGER.info(" Polling is disabled via options. Skipping automatic update.")
+            return self.data
+                 
+
+        try:
+            url = f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/sisf-db-mac"
+            headers = {"Accept": "application/yang-data+json"}
+
+            async with self.session.get(url, headers=headers, auth=self.auth) as response:
+                response_text = await response.text()
+
+                if response.status == 409:  # API Overload (Too many sessions)
+                    _LOGGER.warning("WLC API Overload (Too many sessions). Skipping this update cycle.")
+                    return self.coordinator.data  #  Return existing data to avoid overwriting
+
+                if response.status != 200:
+                    _LOGGER.error(f"HTTP {response.status}: Error fetching client list - {response_text}")
+                    raise UpdateFailed(f"HTTP {response.status}: {response_text}")
+
+                try:
+                    data = await response.json()
+                except Exception as json_err:
+                    _LOGGER.error(f"JSON Parsing Error: {json_err} - Response: {response_text}")
+                    raise UpdateFailed("JSON Parsing Error")
+
+            #  Get the list of currently active clients (only those in the WLC response)
+            clients = data.get("Cisco-IOS-XE-wireless-client-oper:sisf-db-mac", [])
+            if not isinstance(clients, list):
+                _LOGGER.error(f"Unexpected response format from WLC: {data}")
+                raise UpdateFailed("Unexpected response format from WLC")
+
+            #  Prepare updated client data (ALL active MACs get at least their IP)
+            client_data = {}
+
+            for client in clients:
+                mac = client.get("mac-addr", "").lower()
+                if not mac:
+                    continue  # Skip invalid MACs
+
+                # Extract and store IPv4 address
+                ip_entry = client.get("ipv4-binding", {}).get("ip-key", {})
+                ipv4_address = ip_entry.get("ip-addr", "N/A")
+
+                #  Store ALL active MACs with basic data
+                client_data[mac] = {"IP Address": ipv4_address}
+
+            self.async_set_updated_data(client_data)  # Ensure HA gets updates!
+
+            return client_data
+
+        except UpdateFailed as update_err:
+            _LOGGER.error(f"UpdateFailed Error: {update_err}")
+            raise
+
+        except Exception as err:
+            _LOGGER.warning(f"Unexpected error fetching WLC data: {str(err)}")
+            raise UpdateFailed(f"Unexpected error: {str(err)}")
+
+############################################################################################################
+
     async def _async_update_data(self):
         """Fetch all connected clients from Cisco WLC but only update tracked entities."""
 
@@ -148,6 +212,32 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
            
              #  Find MACs that are both tracked and currently active
             tracked_and_active_macs = tracked_macs & active_macs  # Intersection of both sets
+
+            new_clients = active_macs - tracked_macs
+
+            if new_clients:
+                _LOGGER.info(f" New clients detected: {', '.join(new_clients)}")
+
+                # 🚀 **Check if `async_add_entities` exists**
+                if hasattr(self, "async_add_entities") and self.async_add_entities is not None:
+                    _LOGGER.debug(f" Adding {len(new_clients)} new clients dynamically.")
+
+                    new_entities = [
+                        CiscoWLCClient(self, mac, self.data.get(mac, {}), enable_by_default=True)
+                        for mac in new_clients
+                    ]
+
+                    # 
+                    existing_entities = {entity.entity_id for entity in self.hass.states.async_all("device_tracker")}
+                    new_entities = [e for e in new_entities if f"device_tracker.cisco_9800_wlc_{e.mac.replace(':', '_')}" not in existing_entities]
+
+                    if new_entities:
+                       self.async_add_entities(new_entities)
+                    else:
+                        _LOGGER.info("No truly new entities to add.")
+
+                else:
+                    _LOGGER.debug("No new entites found.")
 
             #  Prepare updated client data (ALL active MACs get at least their IP)
             client_data = {}
@@ -201,7 +291,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.warning(f"Unexpected error fetching WLC data: {str(err)}")
             raise UpdateFailed(f"Unexpected error: {str(err)}")
 
-############################################################################################################
+
 
     async def fetch_wlc_status(self):
         """Fetch the WLC online status and software version using the existing connection."""

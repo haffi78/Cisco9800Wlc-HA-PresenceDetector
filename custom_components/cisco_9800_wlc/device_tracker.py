@@ -252,9 +252,18 @@ async def async_setup_entry(hass, entry, async_add_entities):
         wlc_software_version=coordinator.data.get("wlc_status", {}).get("software_version", "n/a")
     )
 
-    async_add_entities([wlc_status_entity])
-    hass.data[DOMAIN]["wlc_status_entity"] = wlc_status_entity 
-    wlc_status_entity.async_write_ha_state()
+    async_add_entities([wlc_status_entity])  # ✅ First, add entity so `hass` is assigned
+    hass.data[DOMAIN]["wlc_status_entity"] = wlc_status_entity
+
+    # ✅ Wait for Home Assistant to fully assign `hass`
+    async def finalize_wlc_status():
+        await asyncio.sleep(0)  # Yield control to Home Assistant
+        if wlc_status_entity.hass is not None:
+            wlc_status_entity.async_write_ha_state()
+        else:
+            _LOGGER.warning("WLC Status entity `hass` is still None. Skipping state update.")
+
+    hass.async_create_task(finalize_wlc_status())  # ✅ Run async task instead
    
     if wlc_status_entity._attr_online_status != "Online":
         _LOGGER.error(" WLC is offline! Aborting client setup but keeping status entity.")

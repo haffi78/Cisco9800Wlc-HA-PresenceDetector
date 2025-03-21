@@ -330,8 +330,14 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     #  Force the WLC Status entity to refresh in HA UI
                     wlc_status_entity = self.hass.data[DOMAIN].get("wlc_status_entity")
                     if wlc_status_entity:
-                        
-                        wlc_status_entity.async_write_ha_state()
+                        async def finalize_status_update():
+                            await asyncio.sleep(0)  # Yield control to HA to assign hass
+                            if wlc_status_entity.hass is not None:
+                                wlc_status_entity.async_write_ha_state()
+                            else:
+                                _LOGGER.warning("WLC Status entity `hass` is still None in fetch_wlc_status(). Skipping update.")
+
+                        self.hass.async_create_task(finalize_status_update())
                     
 
             except asyncio.TimeoutError:

@@ -1,6 +1,7 @@
 """Device tracker for Cisco 9800 WLC integration."""
 from __future__ import annotations
 import logging
+import asyncio
 from homeassistant.components.device_tracker import ScannerEntity
 from typing import Callable, Dict
 from homeassistant.helpers.update_coordinator import CoordinatorEntity

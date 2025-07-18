@@ -1,0 +1,7 @@
+{
+  "name": "Cisco 9800 WLC Device Tracker",
+  "domain": "cisco_9800_wlc",
+  "homeassistant": "2023.0.0",
+  "content_in_root": false,
+  "render_readme": true
+}

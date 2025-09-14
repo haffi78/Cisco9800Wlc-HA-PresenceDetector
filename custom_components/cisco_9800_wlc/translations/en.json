@@ -9,7 +9,7 @@
                     "host": "WLC IP Address",
                     "username": "Username",
                     "password": "Password",
-                    "verify_ssl": "Ignore Self-Signed SSL Certificates"
+                    "ignore_ssl": "Ignore Self-Signed SSL Certificates"
                 },
                 "errors": {
                     "cannot_connect": "Unable to connect to Cisco 9800 WLC. Check the IP address and credentials.",
@@ -24,7 +24,7 @@
                 "init": {
                     "title": "Cisco 9800 WLC Options",
                     "data": {
-                        "enable_new_entities": "Disable newly discovered devices by default)"
+                        "enable_new_entities": "Disable newly discovered devices by default"
                     }
                 }
             }

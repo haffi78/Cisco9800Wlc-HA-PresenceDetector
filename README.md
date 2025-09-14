@@ -2,11 +2,11 @@
 
 ![Cisco 9800 WLC](icons/logo.png)
 
-## 📌 Overview
+##  Overview
 
 The **Cisco 9800 WLC Device Tracker** is a **Home Assistant** custom integration that tracks devices connected to a **Cisco 9800 Wireless LAN Controller (WLC)**. This integration retrieves connection details using the **RESTCONF API** and updates Home Assistant entities.
 
-## ✨ Features
+##  Features
 
 ✔️ **Track connected devices** on your Cisco 9800 WLC.  
 ✔️ **UI-based setup** – No YAML needed.  
@@ -17,7 +17,7 @@ The **Cisco 9800 WLC Device Tracker** is a **Home Assistant** custom integration
 ✔️ System pulls wifi connected clients, get mac and ip address, then looks up enabled devices from home and pulls extra attributes.
 
 
-## 🚀 Installation Guide
+##  Installation Guide
 
 ### **Manual Installation**
 1. Download the latest release from [GitHub](https://github.com/haffi78/Cisco9800Wlc-HA-PresenceDetector).
@@ -38,11 +38,12 @@ The **Cisco 9800 WLC Device Tracker** is a **Home Assistant** custom integration
 1. Go to **Settings** → **Devices & Services** → **Add Integration**.
 2. Search for **Cisco 9800 WLC** and select it.
 3. Enter the required details:
-   - 🏠 **WLC IP Address**
-   - 👤 **Username**
-   - 🔑 **Password**
-   - 🔒 **SSL Verification** (Optional)
+   -  **WLC IP Address**
+   -  **Username**
+   -  **Password**
+   -  **SSL Verification** (Optional)
 4. Click **Submit**.
+5. Go Under - Settings - Device & services - Cisco 9800 WLC - three dots on your WLC , you should have 1 Device, and X many entities, you need to click on the Entities and enable the ones you want to follow.
 
 ### ⚙️ Available Options
 - **Disable newly discovered devices**: Prevents new entities from being added automatically.
@@ -53,7 +54,7 @@ The **Cisco 9800 WLC Device Tracker** is a **Home Assistant** custom integration
 |-------|----------|
 
 
-## 📜 License
+##  License
 
 This project is licensed under the **MIT License**.
 

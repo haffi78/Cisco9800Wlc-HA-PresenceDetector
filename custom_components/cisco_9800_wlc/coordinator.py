@@ -9,7 +9,7 @@ from urllib.parse import quote
 import xml.etree.ElementTree as ET
 from datetime import timedelta
 from datetime import datetime
-from .const import DEFAULT_TRACK_NEW ,DOMAIN  
+from .const import DEFAULT_TRACK_NEW ,DOMAIN,CONF_IGNORE_SSL
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -67,7 +67,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         self.host = config[CONF_HOST]
         self.username = config[CONF_USERNAME]
         self.password = config[CONF_PASSWORD]
-        self.verify_ssl = not config.get(CONF_VERIFY_SSL, False)
+        self.verify_ssl = not config.get(CONF_IGNORE_SSL, False)
 
         self.api_url = f"https://{self.host}/restconf/data"
         self.data = {}

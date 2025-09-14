@@ -5,7 +5,7 @@ from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 from homeassistant.const import CONF_HOST, CONF_USERNAME, CONF_PASSWORD, CONF_VERIFY_SSL
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from .const import DOMAIN
+from .const import DOMAIN, CONF_IGNORE_SSL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -13,7 +13,7 @@ DATA_SCHEMA = vol.Schema({
     vol.Required(CONF_HOST): str,
     vol.Required(CONF_USERNAME): str,
     vol.Required(CONF_PASSWORD): str,
-    vol.Optional(CONF_VERIFY_SSL, default=True): bool,
+    vol.Optional(CONF_IGNORE_SSL, default=False): bool,
     vol.Optional("enable_new_entities", default=False): bool 
 })
 class CiscoWLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -25,7 +25,10 @@ class CiscoWLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors = {}
 
         if user_input is not None:
-            session = async_get_clientsession(self.hass, verify_ssl=not user_input[CONF_VERIFY_SSL])
+            session = async_get_clientsession(
+                self.hass,
+                verify_ssl=not user_input.get(CONF_IGNORE_SSL, False)
+        )
             url = f"https://{user_input[CONF_HOST]}/restconf/data"
             auth = aiohttp.BasicAuth(user_input[CONF_USERNAME], user_input[CONF_PASSWORD])
             headers = {"Accept": "application/yang-data+json"}

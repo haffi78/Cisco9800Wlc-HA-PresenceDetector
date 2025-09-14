@@ -3,23 +3,23 @@ import json
 import logging
 import aiohttp
 import asyncio
-import locale
 import re
 from urllib.parse import quote
-import xml.etree.ElementTree as ET
 from datetime import timedelta
 from datetime import datetime
-from .const import DEFAULT_TRACK_NEW ,DOMAIN,CONF_IGNORE_SSL
+from .const import DOMAIN, CONF_IGNORE_SSL, SIGNAL_NEW_CLIENTS
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.const import CONF_HOST, CONF_USERNAME, CONF_PASSWORD, CONF_VERIFY_SSL
+from homeassistant.const import CONF_HOST, CONF_USERNAME, CONF_PASSWORD
 from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.entity_registry import RegistryEntryDisabler
-from .device_tracker import CiscoWLCClient
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.storage import Store
 
 _LOGGER = logging.getLogger(__name__)
-SCAN_INTERVAL = timedelta(seconds=120)
+SCAN_INTERVAL = timedelta(seconds=60)
+
+# Dispatcher signal name used to announce newly discovered clients (MACs)
 
 PER_CLIENT_URLS = {
     "common": "/Cisco-IOS-XE-wireless-client-oper:client-oper-data/common-oper-data={mac}",
@@ -38,17 +38,36 @@ def format_roaming_time(timestamp):
     - Output: "22:04:19 - 12 March"
     """
     try:
-        #  Convert to datetime object
         dt = datetime.fromisoformat(timestamp)
-
-        #  Set locale for month name translation (adjust based on language)
-        locale.setlocale(locale.LC_TIME, "en_US.UTF-8")  # Change as needed ("sv_SE.UTF-8" for Swedish)
-
-        #  Format: "22:04:19 - 12 March"
         return dt.strftime("%H:%M:%S - %d %B")
-
     except ValueError:
         return timestamp
+
+def extract_semver_from_version_string(text: str) -> str:
+    """Extract x.y.z semantic version from a Cisco version string.
+
+    Examples:
+    - "... Version 17.15.3, RELEASE ..." -> "17.15.3"
+    - "17.15.3" -> "17.15.3"
+    Falls back to the original trimmed text if no match.
+    """
+    if not isinstance(text, str):
+        return "n/a"
+    s = text.strip()
+    # Prefer explicit "Version <semver>"
+    m = re.search(r"\bVersion\s+(\d+\.\d+\.\d+)\b", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # Fallback: any first x.y.z occurrence
+    m = re.search(r"\b(\d+\.\d+\.\d+)\b", s)
+    if m:
+        return m.group(1)
+    return s or "n/a"
+
+# MAC address patterns
+MAC_REGEX_COLON = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")  # 00:1A:2B:3C:4D:5E
+MAC_REGEX_HYPHEN = re.compile(r"^([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$")  # 12-34-56-78-9A-BC
+MAC_REGEX_CISCO = re.compile(r"^([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}$")  # 001a.23d4.3aa2
 
 class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
     """Coordinator to manage Cisco 9800 WLC API polling."""
@@ -62,12 +81,13 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         if not polling_enabled:
             _LOGGER.info("Polling is disabled in system options. Updates will only occur manually.")
         else:
-            _LOGGER.info(f" Polling is enabled. Update interval: {SCAN_INTERVAL}")
+            _LOGGER.info(f"Polling is enabled. Update interval: {SCAN_INTERVAL}")
         self.hass = hass
         self.host = config[CONF_HOST]
         self.username = config[CONF_USERNAME]
         self.password = config[CONF_PASSWORD]
         self.verify_ssl = not config.get(CONF_IGNORE_SSL, False)
+        self.entry_id = config.get("entry_id", "")
 
         self.api_url = f"https://{self.host}/restconf/data"
         self.data = {}
@@ -77,7 +97,86 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         #  Store authentication **once** in `self.auth`
         self.auth = aiohttp.BasicAuth(self.username, self.password)
 
-        hass.loop.create_task(self.delayed_first_scan())
+        self.hass.async_create_task(self.delayed_first_scan())
+        # Track clients we've already announced as "new"; persist across restarts
+        self._announced_new_clients: set[str] = set()
+        self._announced_loaded: bool = False
+        self._store = Store(self.hass, 1, f"{DOMAIN}_announced_{self.entry_id}")
+        # Version fetch cadence control
+        self._last_version_fetch: datetime | None = None
+        self._version_fetch_interval = timedelta(minutes=10)
+        # One-time INFO summary after first successful full scan
+        self._first_scan_info_logged = False
+
+    def _set_wlc_status(
+        self,
+        online: bool | None = None,
+        software_version: str | None = None,
+        software_version_raw: str | None = None,
+        push: bool = False,
+    ) -> None:
+        """Update controller status and optionally notify HA.
+
+        online: True -> Online, False -> Offline, None -> keep previous
+        software_version: set if provided, else keep previous
+        push: when True, calls async_set_updated_data(self.data)
+        """
+        prev = self.data.get("wlc_status", {}) if isinstance(self.data, dict) else {}
+        version = software_version if software_version is not None else prev.get("software_version", "n/a")
+        version_raw = (
+            software_version_raw if software_version_raw is not None else prev.get("software_version_raw", "n/a")
+        )
+        status = prev.get("online_status", "Unknown")
+        if online is True:
+            status = "Online"
+        elif online is False:
+            status = "Offline"
+        if not isinstance(self.data, dict):
+            self.data = {}
+        self.data["wlc_status"] = {
+            "software_version": version,
+            "software_version_raw": version_raw,
+            "online_status": status,
+        }
+        if push:
+            self.async_set_updated_data(self.data)
+    def _polling_disabled(self):
+        """Return True if polling is disabled in options."""
+        opts = self.hass.data.get(DOMAIN, {}).get(self.entry_id, {}).get("options", {})
+        return bool(opts.get("disable_polling", False))
+
+    async def _load_announced(self):
+        """Load announced MACs from storage once per session."""
+        if self._announced_loaded:
+            return
+        try:
+            data = await self._store.async_load()
+            if isinstance(data, list):
+                self._announced_new_clients = set(m.lower() for m in data)
+            self._announced_loaded = True
+        except Exception as err:
+            _LOGGER.warning(f"Failed to load announced clients: {err}")
+            self._announced_loaded = True
+
+    async def _get(self, url: str, timeout: int = 5):
+        """HTTP GET helper that safely returns status, json (if any), and text.
+        Uses async context manager to ensure connections are released.
+        """
+        headers = {"Accept": "application/yang-data+json"}
+        async with self.session.get(url, headers=headers, auth=self.auth, timeout=timeout) as response:
+            status = response.status
+            if status == 200:
+                try:
+                    data = await response.json()
+                    return status, data, None
+                except Exception as json_err:
+                    text = await response.text()
+                    _LOGGER.error(f"JSON Parsing Error for {url}: {json_err} - Response: {text}")
+                    return status, None, text
+            else:
+                text = await response.text()
+                return status, None, text
+
 ############################################################################################################
 
     async def async_fetch_initial_status(self):
@@ -94,7 +193,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         await asyncio.sleep(2)  # Short delay after startup
 
         # ✅ Prevent immediate duplicate calls if polling is already scheduled
-        if self.config_entry.options.get("disable_polling", False):
+        if self._polling_disabled():
             _LOGGER.debug("Polling is disabled. Skipping delayed first scan.")
             return
 
@@ -107,30 +206,32 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
     async def _async_firstrun(self):
         """Fetch all connected clients from Cisco WLC but only update tracked entities."""
 
-        if self.config_entry.options.get("disable_polling", False):
+        if self._polling_disabled():
             _LOGGER.info(" Polling is disabled via options. Skipping automatic update.")
             return self.data
-                 
 
         try:
             url = f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/sisf-db-mac"
             headers = {"Accept": "application/yang-data+json"}
 
-            async with self.session.get(url, headers=headers, auth=self.auth) as response:
-                response_text = await response.text()
-
-                if response.status == 409:  # API Overload (Too many sessions)
+            async with self.session.get(url, headers=headers, auth=self.auth, timeout=5) as response:
+                if response.status == 409:
                     _LOGGER.warning("WLC API Overload (Too many sessions). Skipping this update cycle.")
-                    return self.coordinator.data  #  Return existing data to avoid overwriting
+                    return self.data
 
                 if response.status != 200:
+                    response_text = await response.text()
                     _LOGGER.error(f"HTTP {response.status}: Error fetching client list - {response_text}")
+                    # Mark controller Offline on client fetch failure
+                    self._set_wlc_status(online=False, push=True)
                     raise UpdateFailed(f"HTTP {response.status}: {response_text}")
 
+                response_text = await response.text()
                 try:
-                    data = await response.json()
+                    data = json.loads(response_text)
                 except Exception as json_err:
                     _LOGGER.error(f"JSON Parsing Error: {json_err} - Response: {response_text}")
+                    self._set_wlc_status(online=False, push=True)
                     raise UpdateFailed("JSON Parsing Error")
 
             #  Get the list of currently active clients (only those in the WLC response)
@@ -154,16 +255,28 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 #  Store ALL active MACs with basic data
                 client_data[mac] = {"IP Address": ipv4_address}
 
-            self.async_set_updated_data(client_data)  # Ensure HA gets updates!
+            # Preserve and update controller status: mark Online after successful client fetch
+            updated = {}
+            prev_status = self.data.get("wlc_status", {}) if isinstance(self.data, dict) else {}
+            updated["wlc_status"] = {
+                "software_version": prev_status.get("software_version", "n/a"),
+                "software_version_raw": prev_status.get("software_version_raw", "n/a"),
+                "online_status": "Online",
+            }
+            updated.update(client_data)
 
-            return client_data
+            # Return the full updated data to the coordinator
+            return updated
 
         except UpdateFailed as update_err:
             _LOGGER.error(f"UpdateFailed Error: {update_err}")
+            # Already set Offline above; ensure entities are notified
+            self._set_wlc_status(online=False, push=True)
             raise
 
         except Exception as err:
             _LOGGER.warning(f"Unexpected error fetching WLC data: {str(err)}")
+            self._set_wlc_status(online=False, push=True)
             raise UpdateFailed(f"Unexpected error: {str(err)}")
 
 ############################################################################################################
@@ -171,30 +284,33 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self):
         """Fetch all connected clients from Cisco WLC but only update tracked entities."""
 
-        if self.config_entry.options.get("disable_polling", False):
+        if self._polling_disabled():
             _LOGGER.info(" Polling is disabled via options. Skipping automatic update.")
             return self.data
-                 
 
         try:
+            # Ensure announced set is loaded before detection
+            await self._load_announced()
             url = f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/sisf-db-mac"
             headers = {"Accept": "application/yang-data+json"}
 
-            async with self.session.get(url, headers=headers, auth=self.auth) as response:
-                response_text = await response.text()
-
-                if response.status == 409:  # API Overload (Too many sessions)
+            async with self.session.get(url, headers=headers, auth=self.auth, timeout=5) as response:
+                if response.status == 409:
                     _LOGGER.warning("WLC API Overload (Too many sessions). Skipping this update cycle.")
-                    return self.coordinator.data  #  Return existing data to avoid overwriting
+                    return self.data
 
                 if response.status != 200:
+                    response_text = await response.text()
                     _LOGGER.error(f"HTTP {response.status}: Error fetching client list - {response_text}")
+                    self._set_wlc_status(online=False, push=True)
                     raise UpdateFailed(f"HTTP {response.status}: {response_text}")
 
+                response_text = await response.text()
                 try:
-                    data = await response.json()
+                    data = json.loads(response_text)
                 except Exception as json_err:
                     _LOGGER.error(f"JSON Parsing Error: {json_err} - Response: {response_text}")
+                    self._set_wlc_status(online=False, push=True)
                     raise UpdateFailed("JSON Parsing Error")
 
             #  Get the list of currently active clients (only those in the WLC response)
@@ -203,41 +319,31 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 _LOGGER.error(f"Unexpected response format from WLC: {data}")
                 raise UpdateFailed("Unexpected response format from WLC")
 
-            #  Get currently tracked MACs (from HA)
-            tracked_macs = self.get_tracked_macs()
+            #  Get enabled tracked MACs (entities enabled in HA)
+            enabled_tracked_macs = self.get_enabled_tracked_macs()
+            #  Get all registered MACs (includes disabled entries)
+            registered_macs = self.get_registered_macs()
 
             #  Extract MACs seen in the latest WLC scan
             active_macs = {client.get("mac-addr", "").lower() for client in clients if client.get("mac-addr")}
-            _LOGGER.debug(f" Active MAC addresses from WLC: {', '.join(active_macs)}") 
-           
-             #  Find MACs that are both tracked and currently active
-            tracked_and_active_macs = tracked_macs & active_macs  # Intersection of both sets
+            _LOGGER.debug(f"Active MAC addresses from WLC: {', '.join(active_macs)}")
 
-            new_clients = active_macs - tracked_macs
+            #  Find MACs that are both tracked and currently active
+            tracked_and_active_macs = enabled_tracked_macs & active_macs
 
+            # New clients = active but not yet in registry, and not previously announced
+            new_clients = (active_macs - registered_macs) - self._announced_new_clients
             if new_clients:
-                _LOGGER.info(f" New clients detected: {', '.join(new_clients)}")
-
-                # 🚀 **Check if `async_add_entities` exists**
-                if hasattr(self, "async_add_entities") and self.async_add_entities is not None:
-                    _LOGGER.debug(f" Adding {len(new_clients)} new clients dynamically.")
-
-                    new_entities = [
-                        CiscoWLCClient(self, mac, self.data.get(mac, {}), enable_by_default=True)
-                        for mac in new_clients
-                    ]
-
-                    # 
-                    existing_entities = {entity.entity_id for entity in self.hass.states.async_all("device_tracker")}
-                    new_entities = [e for e in new_entities if f"device_tracker.cisco_9800_wlc_{e.mac.replace(':', '_')}" not in existing_entities]
-
-                    if new_entities:
-                       self.async_add_entities(new_entities)
-                    else:
-                        _LOGGER.info("No truly new entities to add.")
-
-                else:
-                    _LOGGER.debug("No new entites found.")
+                _LOGGER.info("Discovered %d new client(s) not yet enabled in HA", len(new_clients))
+                _LOGGER.debug("New client MACs: %s", ", ".join(sorted(new_clients)))
+                async_dispatcher_send(self.hass, SIGNAL_NEW_CLIENTS, self, list(new_clients))
+                # Remember we've announced these already this session
+                self._announced_new_clients.update(new_clients)
+                # Persist to storage
+                try:
+                    await self._store.async_save(sorted(self._announced_new_clients))
+                except Exception as err:
+                    _LOGGER.debug("Failed to persist announced clients: %s", err)
 
             #  Prepare updated client data (ALL active MACs get at least their IP)
             client_data = {}
@@ -255,17 +361,18 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 client_data[mac] = {"IP Address": ipv4_address}
 
             #  Fetch attributes only for tracked & active MACs
-            tasks = [self.fetch_attributes(mac) for mac in tracked_and_active_macs]
+            tracked_and_active_list = sorted(tracked_and_active_macs)
+            tasks = [self.fetch_attributes(mac) for mac in tracked_and_active_list]
 
             attribute_results = []
             for i in range(0, len(tasks), 5):  # Process in batches of 5
                 batch = tasks[i:i+5]
-                batch_results = await asyncio.gather(*batch, return_exceptions=True)  # Await and store results
+                batch_results = await asyncio.gather(*batch, return_exceptions=True)
                 attribute_results.extend(batch_results)
-                await asyncio.sleep(0.1)  # Add small delay after each batch
+                await asyncio.sleep(0.1)
 
             #  Merge attributes into the final client_data (only for tracked MACs)
-            for mac, attributes in zip(tracked_and_active_macs, attribute_results):
+            for mac, attributes in zip(tracked_and_active_list, attribute_results):
                 if isinstance(attributes, dict) and attributes:
                     for key, value in attributes.items():
                         if value not in [None, ""]:  # ✅ Only update non-empty values
@@ -278,17 +385,41 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             #  Log final processed data before sending to HA
             # _LOGGER.debug(f"Final Processed Client Data (All Active MACs Sent to HA, Extra for Tracked): {client_data}")
 
-            #  Send ALL active MACs (basic data for all, enriched for tracked)
-            self.async_set_updated_data(client_data)  # Ensure HA gets updates!
+            #  Send ALL active MACs (basic data for all, enriched for tracked), and mark controller Online on success
+            updated = {}
+            prev_status = self.data.get("wlc_status", {}) if isinstance(self.data, dict) else {}
+            updated["wlc_status"] = {
+                "software_version": prev_status.get("software_version", "n/a"),
+                "software_version_raw": prev_status.get("software_version_raw", "n/a"),
+                "online_status": "Online",
+            }
+            updated.update(client_data)
 
-            return client_data
+            # Trigger a version refresh in the background on a slower cadence
+            now = datetime.now()
+            if self._last_version_fetch is None or (now - self._last_version_fetch) >= self._version_fetch_interval:
+                self._last_version_fetch = now
+                self.hass.async_create_task(self.fetch_wlc_status())
+
+            # One-time INFO summary on first successful scan
+            if not self._first_scan_info_logged:
+                _LOGGER.info(
+                    "Initial WLC scan complete: %d active client(s), %d tracked enabled, %d new",
+                    len(active_macs), len(enabled_tracked_macs), len(new_clients),
+                )
+                self._first_scan_info_logged = True
+
+            # Return the full updated data to the coordinator
+            return updated
 
         except UpdateFailed as update_err:
             _LOGGER.error(f"UpdateFailed Error: {update_err}")
+            self._set_wlc_status(online=False, push=True)
             raise
 
         except Exception as err:
             _LOGGER.warning(f"Unexpected error fetching WLC data: {str(err)}")
+            self._set_wlc_status(online=False, push=True)
             raise UpdateFailed(f"Unexpected error: {str(err)}")
 
 
@@ -312,99 +443,99 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     
                     if response.status != 200:
                         response_text = await response.text()
-                        _LOGGER.error(f" [DEBUG] HTTP {response.status}: Error fetching WLC status - {response_text}")
+                        _LOGGER.debug("HTTP %s: Error fetching WLC status - %s", response.status, response_text)
+                        # Do not flip connectivity on version fetch errors; keep previous status
                         return
 
                     data = await response.json()
-                    software_version = data.get("Cisco-IOS-XE-device-hardware-oper:software-version", "N/A").strip()
+                    # Some versions may wrap the value differently; be defensive
+                    sv_key = "Cisco-IOS-XE-device-hardware-oper:software-version"
+                    if sv_key in data and isinstance(data[sv_key], str):
+                        software_version = data[sv_key].strip()
+                    else:
+                        # Fallback: stringify any value
+                        software_version = str(data.get(sv_key, "N/A")).strip()
 
-                    #  Store WLC status separately in `coordinator.data`
+                    # Update software version only; do not change connectivity here
+                    prev_status = self.data.get("wlc_status", {}) if isinstance(self.data, dict) else {}
                     self.data["wlc_status"] = {
-                        "software_version": software_version,
-                        "online_status": "Online" if software_version != "N/A" else "Offline",
+                        "software_version": extract_semver_from_version_string(software_version),
+                        "software_version_raw": software_version,
+                        "online_status": prev_status.get("online_status", "Unknown"),
                     }
 
-                    #  Notify Home Assistant to refresh entities
-                    self.async_set_updated_data(self.data)  
-
-                    #  Force the WLC Status entity to refresh in HA UI
-                    wlc_status_entity = self.hass.data[DOMAIN].get("wlc_status_entity")
-                    if wlc_status_entity:
-                        async def finalize_status_update():
-                            await asyncio.sleep(0)  # Yield control to HA to assign hass
-                            if wlc_status_entity.hass is not None:
-                                wlc_status_entity.async_write_ha_state()
-                            else:
-                                _LOGGER.warning("WLC Status entity `hass` is still None in fetch_wlc_status(). Skipping update.")
-
-                        self.hass.async_create_task(finalize_status_update())
+                    # Notify Home Assistant to refresh entities via coordinator update
+                    self.async_set_updated_data(self.data)
                     
 
             except asyncio.TimeoutError:
-                _LOGGER.error(" [DEBUG] API request timed out!")
-
+                _LOGGER.debug("WLC status request timed out")
+                # Keep previous connectivity status; do not mark Offline based on version timeout
+                
             except Exception as e:
-                _LOGGER.error(f" [DEBUG] Unexpected error fetching WLC status: {e}")
+                _LOGGER.debug("Unexpected error fetching WLC status: %s", e)
+                # Keep previous connectivity status; do not mark Offline based on version error
 
 ############################################################################################################
 
-    def get_tracked_macs(self):
-        """Retrieve a set of valid MAC addresses that Home Assistant is actively tracking 
-        and belong to this integration's domain.
-        """
-        # Regex patterns for different MAC address formats
-        MAC_REGEX_COLON = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")  # 00:1A:2B:3C:4D:5E
-        MAC_REGEX_HYPHEN = re.compile(r"^([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$")  # 12-34-56-78-9A-BC
-        MAC_REGEX_CISCO = re.compile(r"^([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}$")  # 001a.23d4.3aa2
+    def _normalize_mac(self, mac: str) -> str | None:
+        """Convert MAC addresses into a standard colon-separated format."""
+        mac = (mac or "").lower().strip()
+        if MAC_REGEX_COLON.match(mac):
+            return mac
+        if MAC_REGEX_HYPHEN.match(mac):
+            return mac.replace("-", ":")
+        if MAC_REGEX_CISCO.match(mac):
+            flat = mac.replace(".", "")
+            return ":".join(flat[i:i+2] for i in range(0, 12, 2))
+        return None
 
-        def normalize_mac(mac: str) -> str | None:
-            """Convert MAC addresses into a standard colon-separated format."""
-            mac = mac.lower().strip()  # Convert to lowercase & remove spaces
-
-            if MAC_REGEX_COLON.match(mac):
-                return mac  # Already in correct format
-            
-            if MAC_REGEX_HYPHEN.match(mac):
-                return mac.replace("-", ":")  # Convert hyphens to colons
-            
-            if MAC_REGEX_CISCO.match(mac):
-                # Convert from Cisco format (001a.23d4.3aa2) to colon-separated
-                return ":".join(mac.replace(".", "").upper()[i:i+2] for i in range(0, 12, 2))
-
-            return None  # Invalid format
-
-        entity_registry = er.async_get(self.hass)  # Get entity registry
-        tracked_macs = set()
-
+    def get_enabled_tracked_macs(self):
+        """MACs of entities that are enabled (actively tracked)."""
+        entity_registry = er.async_get(self.hass)
+        macs: set[str] = set()
         for entity_id, entity in entity_registry.entities.items():
             if (
-                entity_id.startswith("device_tracker.")  # Ensure it's a device tracker
-                and not entity.disabled  # Ensure it's enabled
-                and entity.platform == DOMAIN  # Ensure it belongs to this integration's domain
-                and entity.unique_id  # Ensure it has a unique ID
+                entity_id.startswith("device_tracker.")
+                and not entity.disabled
+                and entity.platform == DOMAIN
+                and entity.unique_id
             ):
-                normalized_mac = normalize_mac(entity.unique_id)
+                normalized_mac = self._normalize_mac(entity.unique_id)
                 if normalized_mac:
-                    tracked_macs.add(normalized_mac)
-               
-           # _LOGGER.debug(f"This is the tracked macs {tracked_macs}")
-        return tracked_macs
+                    macs.add(normalized_mac)
+        return macs
+
+    def get_registered_macs(self):
+        """MACs of all entities registered for this integration (enabled or disabled)."""
+        entity_registry = er.async_get(self.hass)
+        macs: set[str] = set()
+        for entity_id, entity in entity_registry.entities.items():
+            if (
+                entity_id.startswith("device_tracker.")
+                and entity.platform == DOMAIN
+                and entity.unique_id
+            ):
+                normalized_mac = self._normalize_mac(entity.unique_id)
+                if normalized_mac:
+                    macs.add(normalized_mac)
+        return macs
 ############################################################################################################
 
     async def fetch_attributes(self, mac):
         """Fetch multiple attributes for a tracked MAC address from Cisco WLC, handling API limits."""
-
         async with self.api_semaphore:  # Prevents API flooding (Max concurrent requests)
             encoded_mac = quote(mac, safe="")  # Properly encode the MAC address
-            attributes = {}
-            attributes["last_updated_time"] = datetime.now().strftime("%H:%M:%S")
-            #  Check if `dc-info` has already been fetched for this MAC
+            attributes = {"last_updated_time": datetime.now().strftime("%H:%M:%S")}
+
+            # Check if we already have device info stored for this MAC
+            existing = self.data.get(mac, {}) if isinstance(self.data, dict) else {}
             has_dc_info = all(
-                attributes.get(attr) not in [None, "", "Unknown", "N/A"]
+                existing.get(attr) not in [None, "", "Unknown", "N/A"]
                 for attr in ["device-name", "device-type", "device-os"]
             )
-            
-            #  Define API calls (fetch everything except `dc-info` if already known)
+
+            # Define API calls
             url_mapping = {
                 "common": f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/common-oper-data={encoded_mac}",
                 "dot11": f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/dot11-oper-data={encoded_mac}",
@@ -412,103 +543,83 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 "roaming_history": f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/mm-if-client-history={encoded_mac}/mobility-history",
             }
 
-            #  Only fetch `dc-info` if it hasn’t been retrieved before
             if not has_dc_info:
                 url_mapping["device"] = f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/dc-info={encoded_mac}"
 
-            headers = {"Accept": "application/yang-data+json"}
-           
+            await asyncio.sleep(0.1)  # Small delay to avoid API rate limits
 
-            await asyncio.sleep(0.1)  #  Small delay to avoid API rate limits
-
-            #  Fetch API data asynchronously
-            tasks = {key: self.session.get(url, headers=headers, auth=self.auth) for key, url in url_mapping.items()}
+            # Launch requests concurrently via helper
+            tasks = {key: self._get(url, timeout=5) for key, url in url_mapping.items()}
             responses = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
-            is_wireless = False  # Default assumption
+            is_wireless = False
 
-            #  Process API responses
-            for (key, response) in zip(tasks.keys(), responses):
-                if isinstance(response, Exception):
-                    _LOGGER.error(f"fetch_attributes: Request failed for {key} ({mac}): {response}")
+            for (key, result) in zip(tasks.keys(), responses):
+                if isinstance(result, Exception):
+                    _LOGGER.error(f"fetch_attributes: Request failed for {key} ({mac}): {result}")
+                    continue
+
+                status, data, text = result
+
+                if status == 409:
+                    _LOGGER.warning(f"WLC API Overload (Too many sessions): Skipping {mac}.")
+                    return self.data.get(mac, {})
+
+                if status == 404:
+                    continue
+                if status != 200:
                     continue
 
                 try:
-                    response_text = await response.text()
-
-                    if response.status == 409:  # API Overload
-                        _LOGGER.warning(f"WLC API Overload (Too many sessions): Skipping {mac}.")
-                        return self.data.get(mac, {})  #  Keep existing data, avoid overwriting
-
-                    if response.status == 404:
-                        continue
-                    elif response.status != 200:
-                        continue
-
-                    data = await response.json()
                     root_key = list(data.keys())[0]
                     items = data[root_key]
 
                     if isinstance(items, list) and len(items) > 0:
-                        items = items[0]  #  Extract first item from list
+                        items = items[0]
 
                     if key == "speed" and isinstance(items, int):
                         attributes["speed"] = items
-                        
-                        continue  #  Speed is just an integer, no further processing needed
+                        continue
 
                     if not isinstance(items, dict):
                         continue
 
-                    #  Process `common` attributes (Determining if WiFi or wired)
                     if key == "common":
-                        attributes["ap-name"] = items.get("ap-name", "Wired Connection" if "ap-name" not in items else items["ap-name"])
-                        attributes["username"] = items.get("username", None)
-                        is_wireless = bool(attributes["ap-name"])  #  True if AP name exists
-                        
+                        ap_name = items.get("ap-name")
+                        attributes["ap-name"] = ap_name if ap_name else "Wired Connection"
+                        attributes["username"] = items.get("username")
+                        is_wireless = bool(ap_name)
 
-                    #  Process `dot11` attributes
                     elif key == "dot11":
-                        attributes["current-channel"] = items.get("current-channel", None if is_wireless else None)
-                        attributes["auth-key-mgmt"] = items.get("ms-wifi", {}).get("auth-key-mgmt", None)
-                        attributes["ssid"] = items.get("vap-ssid", None)
+                        attributes["current-channel"] = items.get("current-channel") if is_wireless else None
+                        attributes["auth-key-mgmt"] = items.get("ms-wifi", {}).get("auth-key-mgmt")
+                        attributes["ssid"] = items.get("vap-ssid")
                         attributes["WifiStandard"] = items.get("ewlc-ms-phy-type", "Unknown")
 
-                    #  Process `dc-info` (Only fetched if missing in `self.data`)
                     elif key == "device":
-                        attributes["device-name"] = items.get("device-name", None)
-                        attributes["device-type"] = items.get("device-type", None)
-                        attributes["device-os"] = items.get("device-os", None)
+                        attributes["device-name"] = items.get("device-name")
+                        attributes["device-type"] = items.get("device-type")
+                        attributes["device-os"] = items.get("device-os")
 
-                    #  Process `roaming_history`
                     elif key == "roaming_history":
                         mobility_entries = items.get("entry", [])
-
                         if isinstance(mobility_entries, list):
-                            #  Ensure entries are sorted correctly (most recent first)
                             mobility_entries.sort(key=lambda x: x.get("ms-assoc-time", 0), reverse=True)
-
                             formatted_roaming = []
                             for entry in mobility_entries:
                                 ap_name = entry.get("ap-name", "Unknown AP")
                                 raw_time = entry.get("ms-assoc-time", "")
-
-                                #  Use the helper function to format the time
                                 formatted_time = format_roaming_time(raw_time)
-
                                 formatted_roaming.append(f"Roamed: {ap_name} at {formatted_time}")
 
-                            #  Assign formatted timestamps
                             if formatted_roaming:
                                 attributes["most_recent_roam"] = formatted_roaming[0] if len(formatted_roaming) > 0 else None
                                 attributes["previous_roam_1"] = formatted_roaming[1] if len(formatted_roaming) > 1 else None
                                 attributes["previous_roam_2"] = formatted_roaming[2] if len(formatted_roaming) > 2 else None
                                 attributes["previous_roam_3"] = formatted_roaming[3] if len(formatted_roaming) > 3 else None
-
                 except Exception as err:
                     _LOGGER.error(f"Error processing {key} attributes for MAC {mac}: {err}")
-            
-            #  **Persist the fetched attributes in `self.data` to keep across update cycles**
-            self.data[mac] = attributes
 
+            # Persist attributes for this MAC
+            self.data[mac] = {**existing, **attributes}
             return attributes

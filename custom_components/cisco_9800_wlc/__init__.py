@@ -4,9 +4,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from .coordinator import CiscoWLCUpdateCoordinator
-
-DOMAIN = "cisco_9800_wlc"
-PLATFORMS = [Platform.DEVICE_TRACKER]
+from .const import DOMAIN
+PLATFORMS = [Platform.DEVICE_TRACKER, Platform.BINARY_SENSOR, Platform.SENSOR]
 _LOGGER = logging.getLogger(__name__)
 
 def setup(hass: HomeAssistant, config: dict) -> bool:

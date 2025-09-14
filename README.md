@@ -1,6 +1,6 @@
 # Cisco 9800 WLC Device Tracker
 
-[![Cisco 9800 WLC](icons/logo.png)](https://github.com/haffi78/Cisco9800Wlc-HA-PresenceDetector/blob/main/custom_components/cisco_9800_wlc/icons/icon.png)
+[![Cisco 9800 WLC]([icons/logo.png](https://github.com/haffi78/Cisco9800Wlc-HA-PresenceDetector/blob/main/custom_components/cisco_9800_wlc/icons/icon.png))](https://github.com/haffi78/Cisco9800Wlc-HA-PresenceDetector/blob/main/custom_components/cisco_9800_wlc/icons/icon.png)
 
 ##  Overview
 

@@ -12,6 +12,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from datetime import timedelta
 from .const import DOMAIN, SIGNAL_NEW_CLIENTS
 from homeassistant.helpers import device_registry as dr
+import re
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -50,19 +51,25 @@ class CiscoWLCClient(CoordinatorEntity, ScannerEntity):
 
     @property
     def name(self):
-        """Return a human-readable name, appending last 4 MAC hex digits.
+        """Return a friendly, stable name with MAC suffix.
 
-        Example: "APPLE, INC." + "44:f3" -> "APPLE, INC.44:f3".
+        Preference order:
+        1) Device Name (e.g., a hostname like "blackeys-phone")
+        2) Device Type (e.g., model)
+        3) Device OS
+        Else fallback to the MAC address.
+        Always append last 2 MAC bytes for disambiguation: " Name ee:ff".
         """
         attributes = self.extra_state_attributes
-        base_name = attributes.get("Device Name")
+        name_candidate = attributes.get("Device Name") or attributes.get("Device Type") or attributes.get("Device OS")
+
         # Compute suffix from last two bytes of MAC
         parts = self.mac.split(":")
-        mac_suffix = f"{parts[-2]}:{parts[-1]}" if len(parts) >= 2 else self.mac[-5:]
+        mac_suffix = f" {parts[-2]}:{parts[-1]}" if len(parts) >= 2 else f" {self.mac[-5:]}"
 
-        if base_name and isinstance(base_name, str) and base_name.strip():
-            return f"{base_name}{mac_suffix}"
-        # Fallback to MAC if no name available
+        if isinstance(name_candidate, str) and name_candidate.strip():
+            return f"{name_candidate}{mac_suffix}"
+        # Fallback to MAC if no other name available
         return self.mac
 
     @property

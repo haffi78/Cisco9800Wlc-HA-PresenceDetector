@@ -6,6 +6,6 @@
   "requirements": ["aiohttp"],
   "codeowners": ["@haffi78"],
   "config_flow": true,
-  "iot_class": "local_polling"
+  "iot_class": "local_polling",
   "integration_type": "integration"
  }

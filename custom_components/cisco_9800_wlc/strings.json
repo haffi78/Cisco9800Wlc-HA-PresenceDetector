@@ -24,7 +24,7 @@
                 "init": {
                     "title": "Cisco 9800 WLC Options",
                     "data": {
-                        "enable_new_entities": "Disable newly discovered devices by default)"
+                        "enable_new_entities": "Disable newly discovered devices by default"
                     }
                 }
             }

@@ -90,8 +90,8 @@ class CiscoWLCClient(CoordinatorEntity, ScannerEntity):
             "Access Point Name": None,
             "Username": None,
             "Current Channel": None,
-            "Fast Roaming": None,
-            "Connection Speed Mps": None,
+            "Roaming": None,
+            "Connection Speed Mbps": None,
             "Device Name": None,
             "Device Type": None,
             "Device OS": None,
@@ -112,9 +112,9 @@ class CiscoWLCClient(CoordinatorEntity, ScannerEntity):
             "SSID": "ssid",
             "Access Point Name": "ap-name",
             "IP Address": "IP Address",
-            "Connection Speed Mps": "speed",
+            "Connection Speed Mbps": "speed",
             "Current Channel": "current-channel",
-            "Fast Roaming": "auth-key-mgmt",
+            "Roaming": "auth-key-mgmt",
             "Device Name": "device-name",
             "Device Type": "device-type",
             "Device OS": "device-os",
@@ -159,8 +159,8 @@ async def async_setup_entry(hass, entry, async_add_entities):
         _LOGGER.info("Polling is disabled in options; manual refresh only")
         coordinator.update_interval = None  # Disable automatic updates
     else:
-        _LOGGER.debug("Polling is enabled; setting update interval")
-        coordinator.update_interval = timedelta(seconds=120)  # Keep existing interval
+        # Respect the coordinator's configured interval (set in coordinator.py)
+        _LOGGER.debug("Polling is enabled; using coordinator interval: %s", coordinator.update_interval)
     
     if not coordinator:
         _LOGGER.error(" Failed to find WLC coordinator for entry %s. Aborting setup.", entry.entry_id)

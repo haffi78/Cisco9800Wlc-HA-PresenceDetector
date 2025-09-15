@@ -17,7 +17,9 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
 
 _LOGGER = logging.getLogger(__name__)
-SCAN_INTERVAL = timedelta(seconds=60)
+SCAN_INTERVAL = timedelta(seconds=30)
+DEBUG_LOG_PAYLOADS = False  # set True temporarily when inspecting raw payloads
+DEBUG_PAYLOAD_MAX_CHARS = 10000  # truncate long payloads in debug logs
 
 # Dispatcher signal name used to announce newly discovered clients (MACs)
 
@@ -29,19 +31,98 @@ PER_CLIENT_URLS = {
     "roaming_history": "/Cisco-IOS-XE-wireless-client-oper:client-oper-data/mm-if-client-history={mac}/mobility-history",
 }
 
-def format_roaming_time(timestamp):
+def _is_meaningful(value) -> bool:
+    """Return True if value is meaningful (not empty/placeholder).
+
+    Treats None, empty/whitespace, and common placeholders like
+    'unknown', 'n/a', 'na' (any case) as not meaningful.
     """
-    Convert ISO 8601 timestamp to 'HH:MM:SS - DD Month' format.
-    
-    Example:
-    - Input: "2025-03-12T22:04:19+00:00"
-    - Output: "22:04:19 - 12 March"
+    if value is None:
+        return False
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return False
+        lowered = s.lower()
+        if lowered in {"unknown", "n/a", "na"}:
+            return False
+    return True
+
+def _parse_to_local_datetime(value):
+    """Parse various time formats to a timezone-aware local datetime.
+
+    Supports:
+    - ISO8601 (e.g., '2025-03-12T22:04:19+00:00', '2025-03-12T22:04:19Z')
+    - Cisco-style 'MM/DD/YYYY HH:MM:SS'
+    - Epoch seconds or milliseconds (int/str)
+    Returns None if parsing fails.
     """
+    local_tz = datetime.now().astimezone().tzinfo
+
+    # Epoch integers (or numeric strings)
+    if isinstance(value, (int, float)):
+        try:
+            # Heuristic: ms vs s
+            ts = float(value)
+            if ts > 1e12:
+                ts = ts / 1000.0
+            dt = datetime.fromtimestamp(ts)
+            return dt.astimezone(local_tz)
+        except Exception:
+            return None
+
+    if not isinstance(value, str):
+        return None
+
+    s = value.strip()
+    if not s:
+        return None
+
+    # Try ISO8601; handle trailing Z
     try:
-        dt = datetime.fromisoformat(timestamp)
-        return dt.strftime("%H:%M:%S - %d %B")
-    except ValueError:
-        return timestamp
+        iso = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=local_tz)
+        return dt.astimezone(local_tz)
+    except Exception:
+        pass
+
+    # Try Cisco UI format: MM/DD/YYYY HH:MM:SS
+    try:
+        dt = datetime.strptime(s, "%m/%d/%Y %H:%M:%S")
+        dt = dt.replace(tzinfo=local_tz)
+        return dt
+    except Exception:
+        pass
+
+    # Try numeric string epoch
+    try:
+        ts = float(s)
+        if ts > 1e12:
+            ts = ts / 1000.0
+        dt = datetime.fromtimestamp(ts)
+        return dt.astimezone(local_tz)
+    except Exception:
+        pass
+
+    return None
+
+
+def format_roaming_time(value):
+    """Format various roaming timestamps to 'HH:MM:SS - DD Month' local time.
+    Returns empty string when parsing fails or timestamp is zero/invalid.
+    """
+    dt = _parse_to_local_datetime(value)
+    if not dt:
+        return ""
+    # Treat epoch/very old dates as invalid for display
+    try:
+        if int(dt.timestamp()) == 0 or dt.year < 1980:
+            return ""
+    except Exception:
+        return ""
+    return dt.strftime("%H:%M:%S - %d %B")
 
 def extract_semver_from_version_string(text: str) -> str:
     """Extract x.y.z semantic version from a Cisco version string.
@@ -168,6 +249,14 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             if status == 200:
                 try:
                     data = await response.json()
+                    if _LOGGER.isEnabledFor(logging.DEBUG) and DEBUG_LOG_PAYLOADS:
+                        try:
+                            payload = json.dumps(data, ensure_ascii=False)
+                            if len(payload) > DEBUG_PAYLOAD_MAX_CHARS:
+                                payload = payload[:DEBUG_PAYLOAD_MAX_CHARS] + " …(truncated)"
+                            _LOGGER.debug("GET %s -> %s JSON: %s", url, status, payload)
+                        except Exception:
+                            _LOGGER.debug("GET %s -> %s (JSON, unserializable)", url, status)
                     return status, data, None
                 except Exception as json_err:
                     text = await response.text()
@@ -175,6 +264,9 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     return status, None, text
             else:
                 text = await response.text()
+                if _LOGGER.isEnabledFor(logging.DEBUG) and DEBUG_LOG_PAYLOADS:
+                    trimmed = text if len(text) <= DEBUG_PAYLOAD_MAX_CHARS else text[:DEBUG_PAYLOAD_MAX_CHARS] + " …(truncated)"
+                    _LOGGER.debug("GET %s -> %s TEXT: %s", url, status, trimmed)
                 return status, None, text
 
 ############################################################################################################
@@ -240,7 +332,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 _LOGGER.error(f"Unexpected response format from WLC: {data}")
                 raise UpdateFailed("Unexpected response format from WLC")
 
-            #  Prepare updated client data (ALL active MACs get at least their IP)
+            #  Prepare updated client data, preserving existing attributes for active MACs
             client_data = {}
 
             for client in clients:
@@ -248,12 +340,17 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 if not mac:
                     continue  # Skip invalid MACs
 
-                # Extract and store IPv4 address
+                # Extract IPv4 address
                 ip_entry = client.get("ipv4-binding", {}).get("ip-key", {})
                 ipv4_address = ip_entry.get("ip-addr", "N/A")
 
-                #  Store ALL active MACs with basic data
-                client_data[mac] = {"IP Address": ipv4_address}
+                # Start with any previously known attributes for this MAC
+                prev_attrs = self.data.get(mac, {}) if isinstance(self.data, dict) else {}
+                merged = dict(prev_attrs)
+                merged["IP Address"] = ipv4_address
+
+                # Stage for further attribute enrichment
+                client_data[mac] = merged
 
             # Preserve and update controller status: mark Online after successful client fetch
             updated = {}
@@ -345,7 +442,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 except Exception as err:
                     _LOGGER.debug("Failed to persist announced clients: %s", err)
 
-            #  Prepare updated client data (ALL active MACs get at least their IP)
+            #  Prepare updated client data, preserving existing attributes for active MACs
             client_data = {}
 
             for client in clients:
@@ -357,8 +454,12 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 ip_entry = client.get("ipv4-binding", {}).get("ip-key", {})
                 ipv4_address = ip_entry.get("ip-addr", "N/A")
 
-                #  Store ALL active MACs with basic data
-                client_data[mac] = {"IP Address": ipv4_address}
+                # Start with any previously known attributes for this MAC, then update IP
+                prev_attrs = self.data.get(mac, {}) if isinstance(self.data, dict) else {}
+                merged = dict(prev_attrs)
+                merged["IP Address"] = ipv4_address
+
+                client_data[mac] = merged
 
             #  Fetch attributes only for tracked & active MACs
             tracked_and_active_list = sorted(tracked_and_active_macs)
@@ -375,7 +476,8 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             for mac, attributes in zip(tracked_and_active_list, attribute_results):
                 if isinstance(attributes, dict) and attributes:
                     for key, value in attributes.items():
-                        if value not in [None, ""]:  # ✅ Only update non-empty values
+                        # Only propagate meaningful values to avoid wiping previously known data
+                        if _is_meaningful(value):
                             client_data[mac][key] = value
                 elif isinstance(attributes, Exception):
                     _LOGGER.error(f"Error fetching attributes for {mac}: {attributes}")
@@ -531,25 +633,31 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             # Check if we already have device info stored for this MAC
             existing = self.data.get(mac, {}) if isinstance(self.data, dict) else {}
             has_dc_info = all(
-                existing.get(attr) not in [None, "", "Unknown", "N/A"]
+                _is_meaningful(existing.get(attr))
                 for attr in ["device-name", "device-type", "device-os"]
             )
 
-            # Define API calls
+            # Define API calls from a single source of truth
+            def _client_url(key: str) -> str:
+                return f"{self.api_url}{PER_CLIENT_URLS[key].format(mac=encoded_mac)}"
+
             url_mapping = {
-                "common": f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/common-oper-data={encoded_mac}",
-                "dot11": f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/dot11-oper-data={encoded_mac}",
-                "speed": f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/traffic-stats={encoded_mac}/speed",
-                "roaming_history": f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/mm-if-client-history={encoded_mac}/mobility-history",
+                "common": _client_url("common"),
+                "dot11": _client_url("dot11"),
+                "speed": _client_url("speed"),
+                "roaming_history": _client_url("roaming_history"),
             }
 
             if not has_dc_info:
-                url_mapping["device"] = f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/dc-info={encoded_mac}"
+                url_mapping["device"] = _client_url("device")
 
             await asyncio.sleep(0.1)  # Small delay to avoid API rate limits
 
-            # Launch requests concurrently via helper
-            tasks = {key: self._get(url, timeout=5) for key, url in url_mapping.items()}
+            # Launch requests concurrently via helper with per-endpoint timeouts
+            timeouts = {"dot11": 8, "common": 5, "speed": 5, "roaming_history": 5, "device": 5}
+            tasks = {key: self._get(url, timeout=timeouts.get(key, 5)) for key, url in url_mapping.items()}
+            if _LOGGER.isEnabledFor(logging.DEBUG) and DEBUG_LOG_PAYLOADS:
+                _LOGGER.debug("Fetching attributes for %s using URLs: %s", mac, url_mapping)
             responses = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
             is_wireless = False
@@ -586,31 +694,58 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
                     if key == "common":
                         ap_name = items.get("ap-name")
+                        # Treat absence of AP name as wired; avoid setting None
                         attributes["ap-name"] = ap_name if ap_name else "Wired Connection"
-                        attributes["username"] = items.get("username")
+                        if _is_meaningful(items.get("username")):
+                            attributes["username"] = items.get("username")
                         is_wireless = bool(ap_name)
 
                     elif key == "dot11":
-                        attributes["current-channel"] = items.get("current-channel") if is_wireless else None
-                        attributes["auth-key-mgmt"] = items.get("ms-wifi", {}).get("auth-key-mgmt")
-                        attributes["ssid"] = items.get("vap-ssid")
-                        attributes["WifiStandard"] = items.get("ewlc-ms-phy-type", "Unknown")
+                        # Populate Wi‑Fi fields whenever the dot11 payload returns them,
+                        # regardless of whether 'common' included an AP name.
+                        ch = items.get("current-channel")
+                        if _is_meaningful(ch):
+                            attributes["current-channel"] = ch
+                        else:
+                            _LOGGER.debug(f"dot11 payload missing current-channel for {mac}; keys: {list(items.keys())}")
+                        akm = items.get("ms-wifi", {}).get("auth-key-mgmt")
+                        if _is_meaningful(akm):
+                            attributes["auth-key-mgmt"] = akm
+                        ssid = items.get("vap-ssid")
+                        if _is_meaningful(ssid):
+                            attributes["ssid"] = ssid
+                        wifi_std = items.get("ewlc-ms-phy-type")
+                        if _is_meaningful(wifi_std):
+                            attributes["WifiStandard"] = wifi_std
 
                     elif key == "device":
-                        attributes["device-name"] = items.get("device-name")
-                        attributes["device-type"] = items.get("device-type")
-                        attributes["device-os"] = items.get("device-os")
+                        # Only include device fields if present; avoid overriding with None/Unknown
+                        dn = items.get("device-name")
+                        if _is_meaningful(dn):
+                            attributes["device-name"] = dn
+                        dt = items.get("device-type")
+                        if _is_meaningful(dt):
+                            attributes["device-type"] = dt
+                        dos = items.get("device-os")
+                        if _is_meaningful(dos):
+                            attributes["device-os"] = dos
 
                     elif key == "roaming_history":
                         mobility_entries = items.get("entry", [])
                         if isinstance(mobility_entries, list):
-                            mobility_entries.sort(key=lambda x: x.get("ms-assoc-time", 0), reverse=True)
+                            # Sort by parsed datetime descending
+                            def _roam_sort_key(e):
+                                dt = _parse_to_local_datetime(e.get("ms-assoc-time"))
+                                return dt.timestamp() if dt else 0.0
+                            mobility_entries.sort(key=_roam_sort_key, reverse=True)
+
                             formatted_roaming = []
                             for entry in mobility_entries:
                                 ap_name = entry.get("ap-name", "Unknown AP")
                                 raw_time = entry.get("ms-assoc-time", "")
                                 formatted_time = format_roaming_time(raw_time)
-                                formatted_roaming.append(f"Roamed: {ap_name} at {formatted_time}")
+                                if _is_meaningful(formatted_time):
+                                    formatted_roaming.append(f"Roamed: {ap_name} at {formatted_time}")
 
                             if formatted_roaming:
                                 attributes["most_recent_roam"] = formatted_roaming[0] if len(formatted_roaming) > 0 else None
@@ -620,6 +755,32 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 except Exception as err:
                     _LOGGER.error(f"Error processing {key} attributes for MAC {mac}: {err}")
 
-            # Persist attributes for this MAC
-            self.data[mac] = {**existing, **attributes}
+            # If channel is still missing but we appear wireless/speedy, retry dot11 once with a longer timeout
+            if not _is_meaningful(attributes.get("current-channel")) and not _is_meaningful(existing.get("current-channel")):
+                try:
+                    status, data, text = await self._get(_client_url("dot11"), timeout=10)
+                    if status == 200 and isinstance(data, dict):
+                        try:
+                            root_key = list(data.keys())[0]
+                            items = data[root_key]
+                            if isinstance(items, list) and items:
+                                items = items[0]
+                            if isinstance(items, dict):
+                                ch = items.get("current-channel")
+                                if _is_meaningful(ch):
+                                    attributes["current-channel"] = ch
+                                ssid = items.get("vap-ssid")
+                                if _is_meaningful(ssid):
+                                    attributes["ssid"] = ssid
+                        except Exception as err:
+                            _LOGGER.debug(f"Retry parse failed for dot11 ({mac}): {err}")
+                except Exception as err:
+                    _LOGGER.debug(f"Retry failed for dot11 ({mac}): {err}")
+
+            # Persist attributes for this MAC without wiping valid existing data
+            merged = dict(existing)
+            for k, v in attributes.items():
+                if _is_meaningful(v):
+                    merged[k] = v
+            self.data[mac] = merged
             return attributes

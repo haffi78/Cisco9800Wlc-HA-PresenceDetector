@@ -17,7 +17,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
 
 _LOGGER = logging.getLogger(__name__)
-SCAN_INTERVAL = timedelta(seconds=30)
+SCAN_INTERVAL = timedelta(seconds=120)
 DEBUG_LOG_PAYLOADS = False  # set True temporarily when inspecting raw payloads
 DEBUG_PAYLOAD_MAX_CHARS = 10000  # truncate long payloads in debug logs
 

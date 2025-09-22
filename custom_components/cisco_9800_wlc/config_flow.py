@@ -1,11 +1,18 @@
 import logging
+import re
 import aiohttp
 import voluptuous as vol
 from homeassistant import config_entries
-from homeassistant.core import HomeAssistant
 from homeassistant.const import CONF_HOST, CONF_USERNAME, CONF_PASSWORD, CONF_VERIFY_SSL
+from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from .const import DOMAIN, CONF_IGNORE_SSL
+from homeassistant.helpers import entity_registry as er, config_validation as cv
+from .const import DOMAIN, CONF_IGNORE_SSL, CONF_DETAILED_MACS, CONF_SCAN_INTERVAL
+from .coordinator import DEFAULT_SCAN_INTERVAL
+
+MAC_REGEX_COLON = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+MAC_REGEX_HYPHEN = re.compile(r"^([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$")
+MAC_REGEX_CISCO = re.compile(r"^([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}$")
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,7 +52,10 @@ class CiscoWLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         return self.async_create_entry(
                             title=user_input[CONF_HOST],
                             data=user_input,
-                            options={"enable_new_entities": user_input.get("enable_new_entities", False)}  # Ensures default if key missing
+                            options={
+                                "enable_new_entities": user_input.get("enable_new_entities", False),
+                                CONF_DETAILED_MACS: [],
+                            },
                         )
 
             except aiohttp.ClientConnectorCertificateError:
@@ -68,17 +78,136 @@ class CiscoWLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             },
         )
 
-    async def async_step_options(self, user_input=None):
-        """Handle options configuration."""
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry):
+        """Return the options flow to configure existing entries."""
+        return CiscoWLCOptionsFlow(config_entry)
+
+
+def normalize_mac(mac: str) -> str | None:
+    """Normalize MAC strings to colon format for consistent storage."""
+    candidate = (mac or "").strip().lower()
+    if MAC_REGEX_COLON.match(candidate):
+        return candidate
+    if MAC_REGEX_HYPHEN.match(candidate):
+        return candidate.replace("-", ":")
+    if MAC_REGEX_CISCO.match(candidate):
+        flattened = candidate.replace(".", "")
+        return ":".join(flattened[i:i + 2] for i in range(0, 12, 2))
+    return None
+
+
+def _build_mac_options(hass, coordinator, existing: list[str]) -> dict[str, str]:
+    """Construct selectable MAC options with friendly labels for the options flow."""
+    macs: set[str] = set()
+    for mac in existing:
+        normalized = normalize_mac(mac)
+        if normalized:
+            macs.add(normalized)
+
+    if coordinator and hasattr(coordinator, "get_registered_macs"):
+        try:
+            macs.update(coordinator.get_registered_macs())
+        except Exception:  # pragma: no cover - defensive logging handled elsewhere
+            _LOGGER.debug("Failed to read registered MACs from coordinator", exc_info=True)
+
+    coordinator_data = getattr(coordinator, "data", {}) if coordinator else {}
+    if isinstance(coordinator_data, dict):
+        for mac in coordinator_data.keys():
+            if mac == "wlc_status":
+                continue
+            normalized = normalize_mac(mac)
+            if normalized:
+                macs.add(normalized)
+
+    # Fallback to entity registry to ensure all configured entities appear
+    entity_registry = er.async_get(hass)
+    for entry in entity_registry.entities.values():
+        if entry.platform != DOMAIN or not entry.unique_id:
+            continue
+        normalized = normalize_mac(entry.unique_id)
+        if normalized:
+            macs.add(normalized)
+
+    options: dict[str, str] = {}
+    for mac in sorted(macs):
+        label = mac
+        details = coordinator_data.get(mac) if isinstance(coordinator_data, dict) else None
+        if isinstance(details, dict):
+            friendly = (
+                details.get("device-name")
+                or details.get("device-type")
+                or details.get("device-os")
+                or details.get("ssid")
+            )
+            if isinstance(friendly, str) and friendly.strip():
+                label = f"{friendly.strip()} ({mac})"
+        options[mac] = label
+    return options
+
+
+class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
+    """Handle the options flow for Cisco 9800 WLC."""
+
+    def __init__(self, config_entry: config_entries.ConfigEntry):
+        self._config_entry = config_entry
+
+    async def async_step_init(self, user_input=None):
+        """Present and process the options form."""
+        current_enable_new = self._config_entry.options.get("enable_new_entities", False)
+        stored_detailed: list[str] = self._config_entry.options.get(CONF_DETAILED_MACS, []) or []
+        current_detailed = [mac for mac in (normalize_mac(m) for m in stored_detailed) if mac]
+        current_interval = int(self._config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL.total_seconds()))
+
+        coordinator = self.hass.data.get(DOMAIN, {}).get(self._config_entry.entry_id)
+        mac_choices = _build_mac_options(self.hass, coordinator, current_detailed)
+
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            detailed_selected = user_input.get(CONF_DETAILED_MACS, [])
+            if isinstance(detailed_selected, dict):
+                detailed_selected = [key for key, selected in detailed_selected.items() if selected]
+            elif not isinstance(detailed_selected, list):
+                detailed_selected = current_detailed
+
+            normalized_selected = {
+                normalized
+                for mac in detailed_selected
+                if (normalized := normalize_mac(mac))
+            }
+
+            try:
+                interval_value = int(user_input.get(CONF_SCAN_INTERVAL, current_interval))
+            except (ValueError, TypeError):
+                interval_value = current_interval
+
+            new_options = {
+                "enable_new_entities": user_input.get("enable_new_entities", current_enable_new),
+                CONF_DETAILED_MACS: sorted(normalized_selected),
+                CONF_SCAN_INTERVAL: max(5, interval_value),
+            }
+            return self.async_create_entry(title="", data=new_options)
+
+        if mac_choices:
+            schema = vol.Schema(
+                {
+                    vol.Optional("enable_new_entities", default=current_enable_new): bool,
+                    vol.Optional(CONF_SCAN_INTERVAL, default=current_interval): vol.All(vol.Coerce(int), vol.Range(min=5, max=3600)),
+                    vol.Optional(CONF_DETAILED_MACS, default=current_detailed): cv.multi_select(mac_choices),
+                }
+            )
+        else:
+            schema = vol.Schema(
+                {
+                    vol.Optional("enable_new_entities", default=current_enable_new): bool,
+                    vol.Optional(CONF_SCAN_INTERVAL, default=current_interval): vol.All(vol.Coerce(int), vol.Range(min=5, max=3600)),
+                }
+            )
 
         return self.async_show_form(
-            step_id="options",
-            data_schema=vol.Schema({
-                vol.Optional("enable_new_entities", default=self.options.get("enable_new_entities", False)): bool
-            }),
+            step_id="init",
+            data_schema=schema,
             description_placeholders={
-                "enable_new_entities_label": "Disable new Entities"  # Custom label text for the user
+                "enable_new_entities_label": "Disable new Entities"
             },
-    )
+        )

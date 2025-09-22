@@ -25,7 +25,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
 
     # Create the coordinator
-    coordinator = CiscoWLCUpdateCoordinator(hass, entry.data)
+    coordinator = CiscoWLCUpdateCoordinator(
+        hass,
+        entry.data,
+        entry.entry_id,
+        entry.options,
+    )
 
     # Fetch initial data
     await coordinator.async_config_entry_first_refresh()
@@ -40,4 +45,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.info("Unloading Cisco 9800 WLC entry")
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unloaded:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+    return unloaded

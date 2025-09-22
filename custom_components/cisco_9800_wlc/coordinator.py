@@ -7,7 +7,7 @@ import re
 from urllib.parse import quote
 from datetime import timedelta
 from datetime import datetime
-from .const import DOMAIN, CONF_IGNORE_SSL, SIGNAL_NEW_CLIENTS
+from .const import DOMAIN, CONF_IGNORE_SSL, SIGNAL_NEW_CLIENTS, CONF_DETAILED_MACS, CONF_SCAN_INTERVAL
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -17,7 +17,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
 
 _LOGGER = logging.getLogger(__name__)
-SCAN_INTERVAL = timedelta(seconds=120)
+DEFAULT_SCAN_INTERVAL = timedelta(seconds=30)
 DEBUG_LOG_PAYLOADS = False  # set True temporarily when inspecting raw payloads
 DEBUG_PAYLOAD_MAX_CHARS = 10000  # truncate long payloads in debug logs
 
@@ -153,22 +153,30 @@ MAC_REGEX_CISCO = re.compile(r"^([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}$")  # 001a.2
 class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
     """Coordinator to manage Cisco 9800 WLC API polling."""
 
-    def __init__(self, hass: HomeAssistant, config: dict):
-        polling_enabled = not hass.data[DOMAIN].get(config.get("entry_id", ""), {}).get("options", {}).get("disable_polling", False)
+    def __init__(self, hass: HomeAssistant, config: dict, entry_id: str, options: dict | None = None):
+        self.entry_id = entry_id
+        self._options = options or {}
+        polling_enabled = not self._options.get("disable_polling", False)
+        interval_value = self._options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL.total_seconds())
+        interval_seconds = max(5, int(interval_value)) if polling_enabled else 0
+        update_interval = timedelta(seconds=interval_seconds) if polling_enabled else None
         super().__init__(
-            hass, _LOGGER, name=DOMAIN, update_interval=SCAN_INTERVAL if polling_enabled else None
+            hass, _LOGGER, name=DOMAIN, update_interval=update_interval
         )
 
         if not polling_enabled:
             _LOGGER.info("Polling is disabled in system options. Updates will only occur manually.")
         else:
-            _LOGGER.info(f"Polling is enabled. Update interval: {SCAN_INTERVAL}")
+            if update_interval:
+                _LOGGER.info("Polling is enabled. Update interval: %s", update_interval)
+            else:
+                _LOGGER.info("Polling is enabled. Using manual refresh only")
         self.hass = hass
         self.host = config[CONF_HOST]
         self.username = config[CONF_USERNAME]
         self.password = config[CONF_PASSWORD]
         self.verify_ssl = not config.get(CONF_IGNORE_SSL, False)
-        self.entry_id = config.get("entry_id", "")
+        self.entry_id = entry_id
 
         self.api_url = f"https://{self.host}/restconf/data"
         self.data = {}
@@ -178,7 +186,6 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         #  Store authentication **once** in `self.auth`
         self.auth = aiohttp.BasicAuth(self.username, self.password)
 
-        self.hass.async_create_task(self.delayed_first_scan())
         # Track clients we've already announced as "new"; persist across restarts
         self._announced_new_clients: set[str] = set()
         self._announced_loaded: bool = False
@@ -223,8 +230,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             self.async_set_updated_data(self.data)
     def _polling_disabled(self):
         """Return True if polling is disabled in options."""
-        opts = self.hass.data.get(DOMAIN, {}).get(self.entry_id, {}).get("options", {})
-        return bool(opts.get("disable_polling", False))
+        return bool(self._options.get("disable_polling", False))
 
     async def _load_announced(self):
         """Load announced MACs from storage once per session."""
@@ -238,6 +244,16 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.warning(f"Failed to load announced clients: {err}")
             self._announced_loaded = True
+
+    def get_detailed_macs(self) -> tuple[set[str], bool]:
+        """Return MACs configured for detailed polling and whether the option was set explicitly."""
+        raw = self._options.get(CONF_DETAILED_MACS)
+        detailed: set[str] = set()
+        for mac in raw or []:
+            normalized_mac = self._normalize_mac(mac)
+            if normalized_mac:
+                detailed.add(normalized_mac)
+        return detailed, raw is not None
 
     async def _get(self, url: str, timeout: int = 5):
         """HTTP GET helper that safely returns status, json (if any), and text.
@@ -279,21 +295,6 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
 ############################################################################################################
 
-
-    async def delayed_first_scan(self):
-        """Wait a short time after startup, then run the first full scan, but only if polling is enabled."""
-        await asyncio.sleep(2)  # Short delay after startup
-
-        # ✅ Prevent immediate duplicate calls if polling is already scheduled
-        if self._polling_disabled():
-            _LOGGER.debug("Polling is disabled. Skipping delayed first scan.")
-            return
-
-        _LOGGER.debug("Starting delayed first scan.")
-        await self._async_update_data()  # Now do the first full scan
-   
-
-############################################################################################################
 
     async def _async_firstrun(self):
         """Fetch all connected clients from Cisco WLC but only update tracked entities."""
@@ -420,19 +421,30 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             enabled_tracked_macs = self.get_enabled_tracked_macs()
             #  Get all registered MACs (includes disabled entries)
             registered_macs = self.get_registered_macs()
+            detailed_macs, detailed_explicit = self.get_detailed_macs()
+            if not detailed_macs and not detailed_explicit:
+                detailed_macs = enabled_tracked_macs
 
             #  Extract MACs seen in the latest WLC scan
             active_macs = {client.get("mac-addr", "").lower() for client in clients if client.get("mac-addr")}
-            _LOGGER.debug(f"Active MAC addresses from WLC: {', '.join(active_macs)}")
+            if _LOGGER.isEnabledFor(logging.DEBUG) and active_macs:
+                _LOGGER.debug(
+                    "WLC reported %d active client(s): %s",
+                    len(active_macs),
+                    ", ".join(sorted(active_macs)),
+                )
 
-            #  Find MACs that are both tracked and currently active
-            tracked_and_active_macs = enabled_tracked_macs & active_macs
+            #  Find MACs that are both in the detailed set and currently active
+            detailed_and_active_macs = detailed_macs & active_macs
 
             # New clients = active but not yet in registry, and not previously announced
             new_clients = (active_macs - registered_macs) - self._announced_new_clients
             if new_clients:
-                _LOGGER.info("Discovered %d new client(s) not yet enabled in HA", len(new_clients))
-                _LOGGER.debug("New client MACs: %s", ", ".join(sorted(new_clients)))
+                _LOGGER.info(
+                    "Discovered %d new client(s) not yet enabled in HA: %s",
+                    len(new_clients),
+                    ", ".join(sorted(new_clients)),
+                )
                 async_dispatcher_send(self.hass, SIGNAL_NEW_CLIENTS, self, list(new_clients))
                 # Remember we've announced these already this session
                 self._announced_new_clients.update(new_clients)
@@ -458,12 +470,19 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 prev_attrs = self.data.get(mac, {}) if isinstance(self.data, dict) else {}
                 merged = dict(prev_attrs)
                 merged["IP Address"] = ipv4_address
+                merged["connected"] = True
 
                 client_data[mac] = merged
 
-            #  Fetch attributes only for tracked & active MACs
-            tracked_and_active_list = sorted(tracked_and_active_macs)
-            tasks = [self.fetch_attributes(mac) for mac in tracked_and_active_list]
+            #  Fetch attributes only for configured detailed MACs that are active
+            detailed_and_active_list = sorted(detailed_and_active_macs)
+            if detailed_and_active_list:
+                _LOGGER.debug(
+                    "Fetching detailed telemetry for %d client(s): %s",
+                    len(detailed_and_active_list),
+                    ", ".join(detailed_and_active_list),
+                )
+            tasks = [self.fetch_attributes(mac) for mac in detailed_and_active_list]
 
             attribute_results = []
             for i in range(0, len(tasks), 5):  # Process in batches of 5
@@ -473,7 +492,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 await asyncio.sleep(0.1)
 
             #  Merge attributes into the final client_data (only for tracked MACs)
-            for mac, attributes in zip(tracked_and_active_list, attribute_results):
+            for mac, attributes in zip(detailed_and_active_list, attribute_results):
                 if isinstance(attributes, dict) and attributes:
                     for key, value in attributes.items():
                         # Only propagate meaningful values to avoid wiping previously known data
@@ -483,6 +502,22 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     _LOGGER.error(f"Error fetching attributes for {mac}: {attributes}")
                 else:
                     _LOGGER.warning(f"Skipping empty attributes for {mac}")
+
+            # Carry forward last-known attributes for clients that dropped offline
+            if isinstance(self.data, dict):
+                previous_clients = {
+                    mac: attrs
+                    for mac, attrs in self.data.items()
+                    if mac != "wlc_status" and isinstance(attrs, dict)
+                }
+            else:
+                previous_clients = {}
+
+            offline_macs = set(previous_clients) - active_macs
+            for mac in offline_macs:
+                preserved = dict(previous_clients[mac])
+                preserved["connected"] = False
+                client_data[mac] = preserved
 
             #  Log final processed data before sending to HA
             # _LOGGER.debug(f"Final Processed Client Data (All Active MACs Sent to HA, Extra for Tracked): {client_data}")
@@ -745,7 +780,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                                 raw_time = entry.get("ms-assoc-time", "")
                                 formatted_time = format_roaming_time(raw_time)
                                 if _is_meaningful(formatted_time):
-                                    formatted_roaming.append(f"Roamed: {ap_name} at {formatted_time}")
+                                    formatted_roaming.append(f"{ap_name} at {formatted_time}")
 
                             if formatted_roaming:
                                 attributes["most_recent_roam"] = formatted_roaming[0] if len(formatted_roaming) > 0 else None
@@ -779,6 +814,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
             # Persist attributes for this MAC without wiping valid existing data
             merged = dict(existing)
+            merged["connected"] = True
             for k, v in attributes.items():
                 if _is_meaningful(v):
                     merged[k] = v

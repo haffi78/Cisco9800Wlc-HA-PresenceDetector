@@ -24,7 +24,9 @@
                 "init": {
                     "title": "Cisco 9800 WLC Options",
                     "data": {
-                        "enable_new_entities": "Disable newly discovered devices by default"
+                        "enable_new_entities": "Disable newly discovered devices by default",
+                        "scan_interval": "Polling interval (seconds)",
+                        "detailed_macs": "Clients to poll for detailed telemetry"
                     }
                 }
             }

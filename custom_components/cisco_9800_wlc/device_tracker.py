@@ -75,7 +75,15 @@ class CiscoWLCClient(CoordinatorEntity, ScannerEntity):
     @property
     def is_connected(self) -> bool:
         """Return True if the client is still connected."""
-        return isinstance(self.coordinator.data, dict) and self.mac in self.coordinator.data
+        if not isinstance(self.coordinator.data, dict):
+            return False
+        client = self.coordinator.data.get(self.mac)
+        if isinstance(client, dict):
+            if "connected" in client:
+                return bool(client["connected"])
+            # Fallback for legacy data without the new flag
+            return True
+        return False
 
     @property
     def extra_state_attributes(self):
@@ -189,10 +197,10 @@ async def async_setup_entry(hass, entry, async_add_entities):
         ):
             known_clients.add(entity_entry.unique_id.lower())
 
-    _LOGGER.debug("Home Assistant knows %d devices", len(known_clients))
     _LOGGER.info(
         "Initial registration: %d active from WLC, %d total to register",
-        len(all_active_clients), len(known_clients | all_active_clients),
+        len(all_active_clients),
+        len(known_clients | all_active_clients),
     )
 
     # **Step 2: Merge Known Clients & Active Clients**

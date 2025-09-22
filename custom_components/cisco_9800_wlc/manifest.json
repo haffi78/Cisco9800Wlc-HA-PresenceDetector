@@ -1,7 +1,7 @@
 {
   "domain": "cisco_9800_wlc",
   "name": "Cisco 9800 WLC Device Tracker",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "documentation": "https://github.com/haffi78/Cisco9800Wlc-HA-PresenceDetector",
   "issue_tracker": "https://github.com/haffi78/Cisco9800Wlc-HA-PresenceDetector/issues",
   "codeowners": ["@haffi78"],

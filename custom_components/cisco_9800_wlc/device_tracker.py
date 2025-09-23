@@ -60,17 +60,7 @@ class CiscoWLCClient(CoordinatorEntity, ScannerEntity):
         Else fallback to the MAC address.
         Always append last 2 MAC bytes for disambiguation: " Name ee:ff".
         """
-        attributes = self.extra_state_attributes
-        name_candidate = attributes.get("Device Name") or attributes.get("Device Type") or attributes.get("Device OS")
-
-        # Compute suffix from last two bytes of MAC
-        parts = self.mac.split(":")
-        mac_suffix = f" {parts[-2]}:{parts[-1]}" if len(parts) >= 2 else f" {self.mac[-5:]}"
-
-        if isinstance(name_candidate, str) and name_candidate.strip():
-            return f"{name_candidate}{mac_suffix}"
-        # Fallback to MAC if no other name available
-        return self.mac
+        return self._current_friendly_name()
 
     @property
     def is_connected(self) -> bool:
@@ -109,8 +99,9 @@ class CiscoWLCClient(CoordinatorEntity, ScannerEntity):
             "Previous Roam 3": None, 
             "IP Address": None,
             "WifiStandard": None,
-            "Last Updated Time": None 
-            
+            "Last Seen": None,
+            "Attributes Updated": None,
+
 
             
         }
@@ -132,7 +123,8 @@ class CiscoWLCClient(CoordinatorEntity, ScannerEntity):
             "Previous Roam 3": "previous_roam_3",   
             "WifiStandard": "WifiStandard",
             "Username": "username",
-            "Last Updated Time": "last_updated_time"
+            "Last Seen": "last_seen",
+            "Attributes Updated": "attributes_updated",
         }
 
         merged_attributes = {}
@@ -145,15 +137,33 @@ class CiscoWLCClient(CoordinatorEntity, ScannerEntity):
 
         
         return merged_attributes
-            
+    def _current_friendly_name(self) -> str:
+        attributes = self.coordinator.data.get(self.mac, {}) if isinstance(self.coordinator.data, dict) else {}
+        name_candidate = attributes.get("device-name") or attributes.get("device-type") or attributes.get("device-os")
+        parts = self.mac.split(":")
+        mac_suffix = f" {parts[-2]}:{parts[-1]}" if len(parts) >= 2 else f" {self.mac[-5:]}"
+        if isinstance(name_candidate, str) and name_candidate.strip():
+            return f"{name_candidate.strip()}{mac_suffix}"
+        return self.mac
+
     @property
     def device_info(self) -> DeviceInfo:
         """Return device registry information for this tracked client."""
         return DeviceInfo(
             connections={(dr.CONNECTION_NETWORK_MAC, self.mac)},
-            name=self.name,
+            name=self._current_friendly_name(),
         )
 
+    async def _async_update_device_registry_name(self) -> None:
+        desired_name = self._current_friendly_name()
+        device_registry = dr.async_get(self.hass)
+        device = device_registry.async_get_device(connections={(dr.CONNECTION_NETWORK_MAC, self.mac)})
+        if device and device.name != desired_name:
+            device_registry.async_update_device(device.id, name=desired_name)
+
+    def _handle_coordinator_update(self) -> None:
+        super()._handle_coordinator_update()
+        self.hass.async_create_task(self._async_update_device_registry_name())
 # -------------------------
 #  Async Setup Entry
 # -------------------------

@@ -4,6 +4,7 @@ import logging
 import aiohttp
 import asyncio
 import re
+from typing import Any
 from urllib.parse import quote
 from datetime import timedelta
 from datetime import datetime
@@ -17,9 +18,12 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
 
 _LOGGER = logging.getLogger(__name__)
-DEFAULT_SCAN_INTERVAL = timedelta(seconds=30)
+DEFAULT_SCAN_INTERVAL = timedelta(seconds=120)
 DEBUG_LOG_PAYLOADS = False  # set True temporarily when inspecting raw payloads
 DEBUG_PAYLOAD_MAX_CHARS = 10000  # truncate long payloads in debug logs
+ENRICH_RETRY_LIMIT = 3
+ENRICH_DELAY_SECONDS = 0.4
+INITIAL_ENRICH_DELAY_SECONDS = 4.0
 
 # Dispatcher signal name used to announce newly discovered clients (MACs)
 
@@ -136,11 +140,11 @@ def extract_semver_from_version_string(text: str) -> str:
         return "n/a"
     s = text.strip()
     # Prefer explicit "Version <semver>"
-    m = re.search(r"\bVersion\s+(\d+\.\d+\.\d+)\b", s, flags=re.IGNORECASE)
+    m = re.search(r"\bVersion\s+(\d+(?:\.\d+)*(?:[A-Za-z]\d*)?)\b", s, flags=re.IGNORECASE)
     if m:
         return m.group(1)
     # Fallback: any first x.y.z occurrence
-    m = re.search(r"\b(\d+\.\d+\.\d+)\b", s)
+    m = re.search(r"\b(\d+(?:\.\d+)*(?:[A-Za-z]\d*)?)\b", s)
     if m:
         return m.group(1)
     return s or "n/a"
@@ -190,11 +194,20 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         self._announced_new_clients: set[str] = set()
         self._announced_loaded: bool = False
         self._store = Store(self.hass, 1, f"{DOMAIN}_announced_{self.entry_id}")
+        self._client_store = Store(self.hass, 1, f"{DOMAIN}_clients_{self.entry_id}")
+        self._client_cache_loaded = False
+        self._initial_enriched: set[str] = set()
+        self._enrich_pending: set[str] = set()
+        self._enrich_attempts: dict[str, int] = {}
+        self._enrich_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._enrich_worker_task: asyncio.Task | None = None
         # Version fetch cadence control
         self._last_version_fetch: datetime | None = None
         self._version_fetch_interval = timedelta(minutes=10)
         # One-time INFO summary after first successful full scan
         self._first_scan_info_logged = False
+        self._last_enrich_status: dict[str, str] = {}
+        self._start_enrich_worker()
 
     def _set_wlc_status(
         self,
@@ -244,6 +257,100 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.warning(f"Failed to load announced clients: {err}")
             self._announced_loaded = True
+
+    async def async_load_cached_clients(self):
+        """Load last-known client attributes from storage."""
+        if self._client_cache_loaded:
+            return
+        try:
+            data = await self._client_store.async_load()
+            if isinstance(data, dict):
+                if not isinstance(self.data, dict):
+                    self.data = {}
+                self.data.update(data)
+                cached_macs = {
+                    mac for mac in data.keys() if isinstance(mac, str)
+                }
+                self._initial_enriched = set(cached_macs)
+        except Exception as err:
+            _LOGGER.debug("Failed to load cached client attributes: %s", err)
+        finally:
+            self._client_cache_loaded = True
+
+    def _start_enrich_worker(self):
+        if self._enrich_worker_task is None or self._enrich_worker_task.done():
+            self._enrich_worker_task = self.hass.loop.create_task(self._enrich_worker())
+            _LOGGER.debug("Started enrichment worker")
+
+    async def _enrich_worker(self):
+        """Background task to process queued one-shot enrichment requests."""
+        while True:
+            mac = await self._enrich_queue.get()
+            retry = False
+            status_hint = 'ok'
+            try:
+                await asyncio.sleep(ENRICH_DELAY_SECONDS)
+                _LOGGER.debug("One-shot enrich started for %s", mac)
+                result = await self.fetch_attributes(mac)
+                if result:
+                    self._enrich_attempts.pop(mac, None)
+                    status_hint = self._last_enrich_status.get(mac, 'ok')
+                    # Push updated data so entities get attributes sooner
+                    self.async_set_updated_data(self.data)
+                    await self._async_update_client_snapshot(mac)
+                    _LOGGER.debug("One-shot enrich completed for %s", mac)
+                else:
+                    attempts = self._enrich_attempts.get(mac, 0) + 1
+                    self._enrich_attempts[mac] = attempts
+                    status_hint = self._last_enrich_status.get(mac, 'error')
+                    if attempts <= ENRICH_RETRY_LIMIT:
+                        _LOGGER.debug("One-shot enrich for %s returned no detailed data (attempt %d/%d); retrying", mac, attempts, ENRICH_RETRY_LIMIT)
+                        retry = True
+                    else:
+                        _LOGGER.warning("One-shot enrich for %s did not return detailed data after %d attempts", mac, attempts)
+                        self._enrich_attempts.pop(mac, None)
+            except Exception as err:  # pragma: no cover - defensive
+                attempts = self._enrich_attempts.get(mac, 0) + 1
+                self._enrich_attempts[mac] = attempts
+                status_hint = 'error'
+                if attempts <= ENRICH_RETRY_LIMIT:
+                    _LOGGER.debug("One-shot enrich failed for %s: %s (attempt %d/%d)", mac, err, attempts, ENRICH_RETRY_LIMIT)
+                    retry = True
+                else:
+                    _LOGGER.warning("One-shot enrich for %s failed after %d attempts: %s", mac, attempts, err)
+                    self._enrich_attempts.pop(mac, None)
+            finally:
+                self._enrich_pending.discard(mac)
+                self._enrich_queue.task_done()
+                if retry:
+                    attempts = max(1, self._enrich_attempts.get(mac, 1))
+                    delay = min(5.0, ENRICH_DELAY_SECONDS * attempts)
+                    if status_hint == 'throttled':
+                        delay = min(10.0, max(delay, ENRICH_DELAY_SECONDS * (attempts + 2)))
+                    await asyncio.sleep(delay)
+                    await self.async_enqueue_enrich({mac})
+
+    async def async_enqueue_enrich(self, macs: set[str]) -> None:
+        if macs:
+            _LOGGER.debug("Queueing %d MAC(s) for one-shot enrichment: %s", len(macs), ", ".join(sorted(macs)))
+        for mac in sorted(macs):
+            if mac in self._enrich_pending:
+                continue
+            self._enrich_pending.add(mac)
+            self._enrich_attempts.setdefault(mac, 0)
+            await self._enrich_queue.put(mac)
+
+    def _schedule_enrich_with_delay(self, macs: set[str], delay: float) -> None:
+        if not macs:
+            return
+
+        macs_to_queue = set(macs)
+
+        async def _delayed_enqueue():
+            await asyncio.sleep(delay)
+            await self.async_enqueue_enrich(macs_to_queue)
+
+        self.hass.loop.create_task(_delayed_enqueue())
 
     def get_detailed_macs(self) -> tuple[set[str], bool]:
         """Return MACs configured for detailed polling and whether the option was set explicitly."""
@@ -454,25 +561,34 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 except Exception as err:
                     _LOGGER.debug("Failed to persist announced clients: %s", err)
 
-            #  Prepare updated client data, preserving existing attributes for active MACs
-            client_data = {}
+            # Queue one-time detailed fetches for unseen MACs
+            enrich_targets = {
+                mac for mac in active_macs
+                if mac not in self._initial_enriched and mac not in self._enrich_pending
+            }
+            if new_clients:
+                enrich_targets.update(new_clients)
+            # Skip MACs that are about to be fetched via detailed polling anyway
+            enrich_targets -= detailed_and_active_macs
+            if enrich_targets:
+                self._schedule_enrich_with_delay(enrich_targets, INITIAL_ENRICH_DELAY_SECONDS)
+
+            #  Prepare updated client data for MACs reported this cycle
+            client_data: dict[str, dict[str, Any]] = {}
 
             for client in clients:
                 mac = client.get("mac-addr", "").lower()
                 if not mac:
                     continue  # Skip invalid MACs
 
-                # Extract and store IPv4 address
                 ip_entry = client.get("ipv4-binding", {}).get("ip-key", {})
                 ipv4_address = ip_entry.get("ip-addr", "N/A")
 
-                # Start with any previously known attributes for this MAC, then update IP
-                prev_attrs = self.data.get(mac, {}) if isinstance(self.data, dict) else {}
-                merged = dict(prev_attrs)
-                merged["IP Address"] = ipv4_address
-                merged["connected"] = True
-
-                client_data[mac] = merged
+                client_data[mac] = {
+                    "IP Address": ipv4_address,
+                    "last_seen": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                    "connected": True,
+                }
 
             #  Fetch attributes only for configured detailed MACs that are active
             detailed_and_active_list = sorted(detailed_and_active_macs)
@@ -485,39 +601,61 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             tasks = [self.fetch_attributes(mac) for mac in detailed_and_active_list]
 
             attribute_results = []
-            for i in range(0, len(tasks), 5):  # Process in batches of 5
-                batch = tasks[i:i+5]
+            batch_size = 3
+            for i in range(0, len(tasks), batch_size):
+                batch = tasks[i:i + batch_size]
                 batch_results = await asyncio.gather(*batch, return_exceptions=True)
                 attribute_results.extend(batch_results)
-                await asyncio.sleep(0.1)
+                if i + batch_size < len(tasks):
+                    await asyncio.sleep(0.3)
 
-            #  Merge attributes into the final client_data (only for tracked MACs)
+            #  Merge attributes into the latest client_data (only for tracked MACs)
             for mac, attributes in zip(detailed_and_active_list, attribute_results):
                 if isinstance(attributes, dict) and attributes:
+                    dest = client_data.setdefault(mac, {})
                     for key, value in attributes.items():
-                        # Only propagate meaningful values to avoid wiping previously known data
                         if _is_meaningful(value):
-                            client_data[mac][key] = value
+                            dest[key] = value
                 elif isinstance(attributes, Exception):
                     _LOGGER.error(f"Error fetching attributes for {mac}: {attributes}")
                 else:
                     _LOGGER.warning(f"Skipping empty attributes for {mac}")
 
-            # Carry forward last-known attributes for clients that dropped offline
-            if isinstance(self.data, dict):
-                previous_clients = {
+            existing_clients = (
+                {
                     mac: attrs
                     for mac, attrs in self.data.items()
                     if mac != "wlc_status" and isinstance(attrs, dict)
                 }
-            else:
-                previous_clients = {}
+                if isinstance(self.data, dict)
+                else {}
+            )
 
-            offline_macs = set(previous_clients) - active_macs
+            # Merge newly collected values with cached data so enrichment sticks
+            merged_client_data: dict[str, dict[str, Any]] = {}
+            for mac, updates in client_data.items():
+                merged = self._merge_client_attributes(existing_clients.get(mac), updates)
+                merged_client_data[mac] = merged
+
+            # Carry forward last-known attributes for clients that dropped offline
+            offline_macs = set(existing_clients) - active_macs
             for mac in offline_macs:
-                preserved = dict(previous_clients[mac])
+                preserved = dict(existing_clients[mac])
                 preserved["connected"] = False
-                client_data[mac] = preserved
+                preserved.pop("last_updated_time", None)
+                merged_client_data[mac] = preserved
+
+            client_data = merged_client_data
+
+            # Incorporate any attributes recorded during processing (e.g., one-shot enrichment)
+            if isinstance(self.data, dict):
+                latest_snapshot = {
+                    mac: attrs
+                    for mac, attrs in self.data.items()
+                    if mac != "wlc_status" and isinstance(attrs, dict)
+                }
+                for mac, existing in latest_snapshot.items():
+                    client_data[mac] = self._merge_client_attributes(existing, client_data.get(mac, {}))
 
             #  Log final processed data before sending to HA
             # _LOGGER.debug(f"Final Processed Client Data (All Active MACs Sent to HA, Extra for Tracked): {client_data}")
@@ -532,6 +670,28 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             }
             updated.update(client_data)
 
+            # Persist last-known attributes (excluding controller status)
+            try:
+                existing_cache = await self._client_store.async_load() or {}
+                if not isinstance(existing_cache, dict):
+                    existing_cache = {}
+                merged_cache: dict[str, dict] = {}
+                for mac, attrs in updated.items():
+                    if mac == "wlc_status" or not isinstance(attrs, dict):
+                        continue
+                    prev_attrs = existing_cache.get(mac, {}) if isinstance(existing_cache, dict) else {}
+                    merged = dict(prev_attrs)
+                    for key, value in attrs.items():
+                        if _is_meaningful(value):
+                            merged[key] = value
+                    merged_cache[mac] = merged
+                await self._client_store.async_save(
+                    merged_cache
+                )
+                self._initial_enriched.update(merged_cache.keys())
+            except Exception as err:
+                _LOGGER.debug("Failed to store client snapshot: %s", err)
+
             # Trigger a version refresh in the background on a slower cadence
             now = datetime.now()
             if self._last_version_fetch is None or (now - self._last_version_fetch) >= self._version_fetch_interval:
@@ -541,8 +701,8 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             # One-time INFO summary on first successful scan
             if not self._first_scan_info_logged:
                 _LOGGER.info(
-                    "Initial WLC scan complete: %d active client(s), %d tracked enabled, %d new",
-                    len(active_macs), len(enabled_tracked_macs), len(new_clients),
+                    "Initial WLC scan complete: %d active client(s), %d detailed polling, %d new",
+                    len(active_macs), len(detailed_and_active_macs), len(new_clients),
                 )
                 self._first_scan_info_logged = True
 
@@ -627,6 +787,48 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             return ":".join(flat[i:i+2] for i in range(0, 12, 2))
         return None
 
+    def _merge_client_attributes(self, existing: dict[str, Any] | None, updates: dict[str, Any]) -> dict[str, Any]:
+        """Merge new per-scan data with cached attributes without dropping useful values."""
+        always_replace = {
+            "connected",
+            "IP Address",
+            "last_seen",
+            "attributes_updated",
+        }
+
+        merged: dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
+        for key, value in updates.items():
+            if key in always_replace:
+                merged[key] = value
+            elif _is_meaningful(value):
+                merged[key] = value
+        merged.pop("last_updated_time", None)
+        return merged
+
+    async def _async_update_client_snapshot(self, mac: str) -> None:
+        """Persist the latest attributes for a single MAC to the cache."""
+        if not isinstance(self.data, dict):
+            return
+        attrs = self.data.get(mac)
+        if not isinstance(attrs, dict):
+            return
+
+        try:
+            existing_cache = await self._client_store.async_load() or {}
+            if not isinstance(existing_cache, dict):
+                existing_cache = {}
+
+            merged = dict(existing_cache.get(mac, {}))
+            for key, value in attrs.items():
+                if _is_meaningful(value) or key in {"connected", "IP Address", "last_seen", "attributes_updated"}:
+                    merged[key] = value
+            merged.pop("last_updated_time", None)
+
+            existing_cache[mac] = merged
+            await self._client_store.async_save(existing_cache)
+        except Exception as err:
+            _LOGGER.debug("Failed to persist snapshot for %s: %s", mac, err)
+
     def get_enabled_tracked_macs(self):
         """MACs of entities that are enabled (actively tracked)."""
         entity_registry = er.async_get(self.hass)
@@ -663,10 +865,18 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         """Fetch multiple attributes for a tracked MAC address from Cisco WLC, handling API limits."""
         async with self.api_semaphore:  # Prevents API flooding (Max concurrent requests)
             encoded_mac = quote(mac, safe="")  # Properly encode the MAC address
-            attributes = {"last_updated_time": datetime.now().strftime("%H:%M:%S")}
+            now_ts = datetime.now().astimezone()
+            attributes: dict[str, Any] = {}
+            received_meaningful = False
+            throttled = False
+            had_error = False
 
             # Check if we already have device info stored for this MAC
             existing = self.data.get(mac, {}) if isinstance(self.data, dict) else {}
+            previous_has_data = any(
+                _is_meaningful(existing.get(slot))
+                for slot in ("previous_roam_1", "previous_roam_2", "previous_roam_3")
+            )
             has_dc_info = all(
                 _is_meaningful(existing.get(attr))
                 for attr in ["device-name", "device-type", "device-os"]
@@ -700,17 +910,28 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             for (key, result) in zip(tasks.keys(), responses):
                 if isinstance(result, Exception):
                     _LOGGER.error(f"fetch_attributes: Request failed for {key} ({mac}): {result}")
+                    had_error = True
                     continue
 
                 status, data, text = result
 
                 if status == 409:
                     _LOGGER.warning(f"WLC API Overload (Too many sessions): Skipping {mac}.")
-                    return self.data.get(mac, {})
+                    throttled = True
+                    self._last_enrich_status[mac] = 'throttled'
+                    return {}
 
                 if status == 404:
                     continue
                 if status != 200:
+                    if status == 400:
+                        throttled = True
+                    else:
+                        had_error = True
+                    if text:
+                        _LOGGER.debug("HTTP %s for %s (%s): %s", status, mac, key, text)
+                    else:
+                        _LOGGER.debug("HTTP %s for %s (%s) with no body", status, mac, key)
                     continue
 
                 try:
@@ -722,17 +943,23 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
                     if key == "speed" and isinstance(items, int):
                         attributes["speed"] = items
+                        received_meaningful = True
                         continue
 
                     if not isinstance(items, dict):
+                        _LOGGER.debug("Detailed payload for %s (%s) not a dict: %r", mac, key, type(items).__name__)
                         continue
 
                     if key == "common":
                         ap_name = items.get("ap-name")
                         # Treat absence of AP name as wired; avoid setting None
                         attributes["ap-name"] = ap_name if ap_name else "Wired Connection"
-                        if _is_meaningful(items.get("username")):
-                            attributes["username"] = items.get("username")
+                        if _is_meaningful(ap_name):
+                            received_meaningful = True
+                        username = items.get("username")
+                        if _is_meaningful(username):
+                            attributes["username"] = username
+                            received_meaningful = True
                         is_wireless = bool(ap_name)
 
                     elif key == "dot11":
@@ -741,29 +968,36 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                         ch = items.get("current-channel")
                         if _is_meaningful(ch):
                             attributes["current-channel"] = ch
+                            received_meaningful = True
                         else:
                             _LOGGER.debug(f"dot11 payload missing current-channel for {mac}; keys: {list(items.keys())}")
                         akm = items.get("ms-wifi", {}).get("auth-key-mgmt")
                         if _is_meaningful(akm):
                             attributes["auth-key-mgmt"] = akm
+                            received_meaningful = True
                         ssid = items.get("vap-ssid")
                         if _is_meaningful(ssid):
                             attributes["ssid"] = ssid
+                            received_meaningful = True
                         wifi_std = items.get("ewlc-ms-phy-type")
                         if _is_meaningful(wifi_std):
                             attributes["WifiStandard"] = wifi_std
+                            received_meaningful = True
 
                     elif key == "device":
                         # Only include device fields if present; avoid overriding with None/Unknown
                         dn = items.get("device-name")
                         if _is_meaningful(dn):
                             attributes["device-name"] = dn
+                            received_meaningful = True
                         dt = items.get("device-type")
                         if _is_meaningful(dt):
                             attributes["device-type"] = dt
+                            received_meaningful = True
                         dos = items.get("device-os")
                         if _is_meaningful(dos):
                             attributes["device-os"] = dos
+                            received_meaningful = True
 
                     elif key == "roaming_history":
                         mobility_entries = items.get("entry", [])
@@ -787,8 +1021,10 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                                 attributes["previous_roam_1"] = formatted_roaming[1] if len(formatted_roaming) > 1 else None
                                 attributes["previous_roam_2"] = formatted_roaming[2] if len(formatted_roaming) > 2 else None
                                 attributes["previous_roam_3"] = formatted_roaming[3] if len(formatted_roaming) > 3 else None
+                                received_meaningful = True
                 except Exception as err:
                     _LOGGER.error(f"Error processing {key} attributes for MAC {mac}: {err}")
+                    had_error = True
 
             # If channel is still missing but we appear wireless/speedy, retry dot11 once with a longer timeout
             if not _is_meaningful(attributes.get("current-channel")) and not _is_meaningful(existing.get("current-channel")):
@@ -804,19 +1040,46 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                                 ch = items.get("current-channel")
                                 if _is_meaningful(ch):
                                     attributes["current-channel"] = ch
+                                    received_meaningful = True
                                 ssid = items.get("vap-ssid")
                                 if _is_meaningful(ssid):
                                     attributes["ssid"] = ssid
+                                    received_meaningful = True
+                                else:
+                                    _LOGGER.debug("Retry dot11 returned no ssid for %s", mac)
                         except Exception as err:
                             _LOGGER.debug(f"Retry parse failed for dot11 ({mac}): {err}")
+                            had_error = True
                 except Exception as err:
                     _LOGGER.debug(f"Retry failed for dot11 ({mac}): {err}")
+                    had_error = True
 
-            # Persist attributes for this MAC without wiping valid existing data
-            merged = dict(existing)
-            merged["connected"] = True
-            for k, v in attributes.items():
-                if _is_meaningful(v):
-                    merged[k] = v
-            self.data[mac] = merged
-            return attributes
+            if received_meaningful:
+                attributes["attributes_updated"] = now_ts.strftime("%Y-%m-%d %H:%M:%S")
+                merged = dict(existing)
+                merged["connected"] = True
+                for k, v in attributes.items():
+                    if _is_meaningful(v):
+                        merged[k] = v
+                    else:
+                        if k not in existing or _is_meaningful(existing.get(k)):
+                            _LOGGER.debug("Skipping update for %s - %s has no meaningful value", mac, k)
+                merged.pop("last_updated_time", None)
+                self.data[mac] = merged
+                self._initial_enriched.add(mac)
+                if throttled:
+                    self._last_enrich_status[mac] = 'throttled'
+                elif had_error:
+                    self._last_enrich_status[mac] = 'error'
+                else:
+                    self._last_enrich_status[mac] = 'ok'
+                return attributes
+
+            _LOGGER.debug("Detailed fetch for %s returned no meaningful attributes", mac)
+            if throttled:
+                self._last_enrich_status[mac] = 'throttled'
+            elif had_error:
+                self._last_enrich_status[mac] = 'error'
+            else:
+                self._last_enrich_status[mac] = 'empty'
+            return {}

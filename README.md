@@ -1,68 +1,41 @@
-# Cisco 9800 WLC Device Tracker
+# Cisco 9800 WLC Home Assistant Integration Guide
 
 ## Overview
-
-The **Cisco 9800 WLC Device Tracker** is a Home Assistant custom integration that discovers and monitors clients connected to a Cisco 9800 Wireless LAN Controller using the RESTCONF API. It provides router-based device tracker entities, a controller connectivity sensor, and a software-version diagnostic sensor, keeping Home Assistant informed about who is on the network.
-
-## Features
-
-- Tracks every client currently reported by the controller and keeps last-known attributes even when clients disconnect.
-- UI-only setup and configuration; no YAML required.
-- Adjustable polling interval (default 30 seconds) directly from the Options dialog.
-- Selective detailed telemetry: choose which MAC addresses receive the heavier per-client RESTCONF lookups (AP name, SSID, device metadata, roaming history, etc.).
-- Newly discovered clients trigger an optional dispatcher signal so you can enable them on demand.
-- Supports ignoring self-signed SSL certificates when talking to the controller.
-- All Wi-Fi client entities start disabled by default to avoid pulling data you do not need.
+This guide explains how to install, configure, and maintain the custom integration that exposes Cisco 9800 Wireless LAN Controller client telemetry to Home Assistant. It complements the in-product help text and should be referenced from the integration manifest.
 
 ## Installation
+1. Copy the `custom_components/cisco_9800_wlc` directory into `<config>/custom_components/` on your Home Assistant instance.
+2. Restart Home Assistant to load the new integration code.
+3. In the UI, navigate to *Settings → Devices & Services → Add Integration* and search for **Cisco 9800 WLC**.
+4. Provide the controller hostname or IP, along with credentials that allow RESTCONF read access.
+5. (Optional) Toggle *Ignore Self-Signed SSL Certificates* if your controller uses a self-signed certificate.
 
-### Manual Installation
-1. Download the latest release from [GitHub](https://github.com/haffi78/Cisco9800Wlc-HA-PresenceDetector).
-2. Copy the `cisco_9800_wlc` directory into your Home Assistant `custom_components` folder:
-   ```
-   /config/custom_components/cisco_9800_wlc
-   ```
-3. Restart Home Assistant.
+## Configuration Parameters
+- **Controller Host** (`host`): The management IP address or DNS name of the WLC. This value cannot be changed after setup; remove and re-add the integration if the host changes.
+- **Username / Password** (`username`, `password`): Credentials used for RESTCONF authentication. If they change later, the integration will prompt you to re-authenticate.
+- **Ignore Self-Signed SSL Certificates** (`ignore_ssl`): When enabled, the integration will trust certificates that cannot be validated. Disable whenever possible.
+- **Disable Newly Discovered Clients by Default** (`enable_new_entities` option): When enabled, newly discovered client trackers remain disabled until you manually enable them in the entity registry.
+- **Polling Interval** (`scan_interval` option): Controls how frequently the controller is polled for the client list. Defaults to 120 seconds; lowering the value increases controller load.
+- **Detailed Client Telemetry** (`detailed_macs` option): A list of client MAC addresses that should receive per-cycle deep polling.
 
-### HACS (Recommended)
-1. Open **HACS** → **Integrations** → **+ Explore & Add Repositories**.
-2. Add `https://github.com/haffi78/Cisco9800Wlc-HA-PresenceDetector` as an integration repository.
-3. Install and restart Home Assistant.
+## Entity Management
+- Each wireless client is exposed as a device tracker entity named after the client and its MAC suffix.
+- The integration also provides a connectivity binary sensor and a software version diagnostic sensor for the controller itself.
+- Entities support the *Enable* toggle in the registry; use it to remove stale clients without deleting the entire integration.
 
-## Configuration
+## Diagnostics and System Health
+- Home Assistant’s diagnostics explorer includes redacted payloads with controller settings, options, and cached client data.
+- The System Health panel reports the most recent successful poll, queued enrichment requests, and whether polling is disabled.
 
-1. In Home Assistant, go to **Settings → Devices & Services → Add Integration**.
-2. Search for **Cisco 9800 WLC** and fill in:
-   - WLC IP address or hostname
-   - Username / password (RESTCONF enabled user)
-   - Whether to ignore SSL certificate validation
-3. Submit to create the config entry.
-4. After setup, open **Settings → Devices & Services → Cisco 9800 WLC → Configure → Options** to fine-tune the behaviour.
-
-### Options Dialog
-
-- **Disable newly discovered devices** – when enabled, new device tracker entities remain disabled until you turn them on manually.
-- **Polling interval (seconds)** – adjust how often the integration polls the controller (minimum 5 seconds, default 30).
-- **Clients to poll for detailed telemetry** – multi-select of known MAC addresses. Only selected clients trigger the heavier per-client RESTCONF calls for SSID, AP, roaming history, etc.; the rest receive lightweight presence/IP updates.
-
-> Tip: leave the list empty if you only need basic presence or IP tracking. Add clients selectively to keep controller load low.
-
-## Entities
-
-- **Device trackers** (`device_tracker.*`) – one per client. The entity stays present even when the client disconnects so you retain useful attributes.
-- **Binary sensor** – reports the controller’s Online/Offline status.
-- **Software version sensor** – exposes the WLC software version and continues to show the last known value even if polling is temporarily disabled.
+## Removal and Reset
+1. Disable or delete any client entities you no longer need from *Settings → Devices & Services → Entities*.
+2. Open the **Cisco 9800 WLC** integration entry and choose *Delete* to remove the config entry and stored credentials.
+3. Clear the `.storage` files prefixed with `cisco_9800_wlc_` if you want to reset cached client state.
+4. Restart Home Assistant to ensure all background tasks terminate cleanly.
 
 ## Troubleshooting
+- **Authentication errors (HTTP 401)**: Confirm credentials and re-run through the re-authentication prompt when presented.
+- **Frequent HTTP 400 responses**: Increase the polling interval or reduce the number of clients listed for detailed telemetry.
+- **Missing clients**: Verify that the client appears in the WLC RESTCONF API and that it has not been manually disabled in the entity registry.
 
-| Symptom | Suggested Action |
-| --- | --- |
-| Integration fails to load with SSL errors | Enable “Ignore self-signed SSL certificates” or install a trusted certificate on the controller. |
-| Detailed telemetry never appears | Ensure the MAC is ticked in the Options dialog and allow one polling interval for attributes to populate. |
-| Polling feels slow | Reduce the detailed telemetry list or increase the polling interval. The base client list fetch typically returns in <0.2s with no detailed MACs selected. |
-| Entities remain disabled | Enable them under **Settings → Devices & Services → Cisco 9800 WLC → Entities**. New devices are created disabled by default. |
-
-## License
-
-Released under the MIT License.
-
+For community support or to report issues, use the GitHub issue tracker referenced in the integration manifest.

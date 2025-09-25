@@ -4,6 +4,15 @@
 This guide explains how to install, configure, and maintain the custom integration that exposes Cisco 9800 Wireless LAN Controller client telemetry to Home Assistant. It complements the in-product help text and should be referenced from the integration manifest.
 
 ## Installation
+
+### HACS (recommended)
+1. Make sure [HACS](https://hacs.xyz/) is installed and set up in Home Assistant.
+2. In HACS, open *Integrations*, click the three-dot menu, and choose *Custom repositories*.
+3. Add `https://github.com/haffi78/Cisco9800Wlc-HA-PresenceDetector` as an `Integration` repository.
+4. Locate **Cisco 9800 WLC** in the HACS integrations list and click *Download*.
+5. Restart Home Assistant when prompted so the integration files are loaded.
+
+### Manual (advanced)
 1. Copy the `custom_components/cisco_9800_wlc` directory into `<config>/custom_components/` on your Home Assistant instance.
 2. Restart Home Assistant to load the new integration code.
 3. In the UI, navigate to *Settings → Devices & Services → Add Integration* and search for **Cisco 9800 WLC**.

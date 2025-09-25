@@ -33,7 +33,8 @@ async def test_diagnostics_sanitizes_clients(hass):
         options={CONF_DETAILED_MACS: ["aa:bb:cc:dd:ee:ff"]},
     )
     coordinator = DummyCoordinator()
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    entry.add_to_hass(hass)
+    entry.runtime_data = coordinator
 
     result = await diagnostics.async_get_config_entry_diagnostics(hass, entry)
 

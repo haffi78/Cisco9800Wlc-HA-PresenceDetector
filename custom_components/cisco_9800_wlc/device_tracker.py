@@ -1,18 +1,22 @@
 """Device tracker for Cisco 9800 WLC integration."""
 from __future__ import annotations
+
 import logging
+from typing import Any, Iterable, cast
+
 from homeassistant.components.device_tracker import ScannerEntity
 from homeassistant.components.device_tracker.const import SourceType
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers import entity_registry as er
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from datetime import timedelta
-from .const import DOMAIN, SIGNAL_NEW_CLIENTS
 from homeassistant.helpers import device_registry as dr
-import re
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+from .const import DOMAIN, SIGNAL_NEW_CLIENTS
+from .coordinator import CiscoWLCUpdateCoordinator, parse_to_local_datetime
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -20,27 +24,33 @@ _LOGGER = logging.getLogger(__name__)
 #  Tracked Client Entity
 # Lets remeber that WLC has a idle timeout so clients will report in even when disconnected for the idle time. default 6 mins.
 # -------------------------
-class CiscoWLCClient(CoordinatorEntity, ScannerEntity):
+class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity):
     """Represents a tracked client device connected to the Cisco WLC."""
 
-    def __init__(self, coordinator, mac, data, enable_by_default):
+    def __init__(
+        self,
+        coordinator: CiscoWLCUpdateCoordinator,
+        mac: str,
+        data: dict[str, Any] | None,
+        enable_by_default: bool,
+    ) -> None:
         """Initialize the WLC tracked client."""
       #  _LOGGER.debug(" Initialize the WLC tracked client.")
         super().__init__(coordinator)
         self.coordinator = coordinator
-        self.mac = mac  
-        self.data = self.coordinator.data.get(self.mac, {})
+        self.mac = mac
+        self.data = data or self.coordinator.data.get(self.mac, {})
         self._attr_should_poll = False  #  Polling is not needed
         self._enable_by_default = enable_by_default  #  Store user preference
       
 
     @property
-    def source_type(self):
+    def source_type(self) -> SourceType:
         """Indicate this is a router-based tracker."""
         return SourceType.ROUTER
 
     @property
-    def unique_id(self):
+    def unique_id(self) -> str:
         """Return a unique ID for the device."""
         return self.mac  #  Uses MAC as-is, which was working before
 
@@ -50,7 +60,7 @@ class CiscoWLCClient(CoordinatorEntity, ScannerEntity):
         return self._enable_by_default  #  Use user setting from config entry
 
     @property
-    def name(self):
+    def name(self) -> str:
         """Return a friendly, stable name with MAC suffix.
 
         Preference order:
@@ -76,7 +86,7 @@ class CiscoWLCClient(CoordinatorEntity, ScannerEntity):
         return False
 
     @property
-    def extra_state_attributes(self):
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return additional attributes about the connected client."""
       
 
@@ -127,7 +137,7 @@ class CiscoWLCClient(CoordinatorEntity, ScannerEntity):
             "Attributes Updated": "attributes_updated",
         }
 
-        merged_attributes = {}
+        merged_attributes: dict[str, Any] = {}
 
         for ha_key, api_key in attribute_key_mapping.items():
             if api_key in attributes and attributes[api_key] is not None:
@@ -135,8 +145,15 @@ class CiscoWLCClient(CoordinatorEntity, ScannerEntity):
             else:
                 merged_attributes[ha_key] = default_attributes.get(ha_key, None)
 
-        
+        for time_key in ("Last Seen", "Attributes Updated"):
+            value = merged_attributes.get(time_key)
+            if value:
+                formatted = _format_timestamp(value)
+                if formatted:
+                    merged_attributes[time_key] = formatted
+
         return merged_attributes
+
     def _current_friendly_name(self) -> str:
         attributes = self.coordinator.data.get(self.mac, {}) if isinstance(self.coordinator.data, dict) else {}
         name_candidate = attributes.get("device-name") or attributes.get("device-type") or attributes.get("device-os")
@@ -168,24 +185,33 @@ class CiscoWLCClient(CoordinatorEntity, ScannerEntity):
 #  Async Setup Entry
 # -------------------------
 
-async def async_setup_entry(hass, entry, async_add_entities):
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
     """Set up Cisco 9800 WLC device tracker from a config entry."""
     _LOGGER.info("Setting up Cisco 9800 WLC device tracker platform")
 
-    coordinator = hass.data[DOMAIN].get(entry.entry_id)
+    data = hass.data[DOMAIN]
+    coordinator = cast(CiscoWLCUpdateCoordinator | None, data.get(entry.entry_id))
+    if coordinator is None:
+        _LOGGER.error(" Failed to find WLC coordinator for entry %s. Aborting setup.", entry.entry_id)
+        return
+    coordinator = cast(CiscoWLCUpdateCoordinator, coordinator)
+
     if entry.options.get("disable_polling", False):
         _LOGGER.info("Polling is disabled in options; manual refresh only")
         coordinator.update_interval = None  # Disable automatic updates
     else:
         # Respect the coordinator's configured interval (set in coordinator.py)
         _LOGGER.debug("Polling is enabled; using coordinator interval: %s", coordinator.update_interval)
-    
-    if not coordinator:
-        _LOGGER.error(" Failed to find WLC coordinator for entry %s. Aborting setup.", entry.entry_id)
-        return
-    
+
     # Track which MACs have entities already added
-    tracked_macs = hass.data[DOMAIN].setdefault("tracked_macs", set())
+    tracked_entries = data.setdefault("tracked_macs", {})
+    tracked_entries = cast(dict[str, set[str]], tracked_entries)
+    tracked_macs = set()
+    tracked_entries[entry.entry_id] = tracked_macs
     enable_new_entities = entry.options.get("enable_new_entities", False)
     
     # Controller status is now provided via binary_sensor platform
@@ -193,19 +219,32 @@ async def async_setup_entry(hass, entry, async_add_entities):
     # Fetch initial list of clients from WLC
     _LOGGER.debug("Fetching initial client list from WLC")
     await coordinator.async_request_refresh()
-    all_active_clients = {k for k in coordinator.data.keys() if k != "wlc_status"}
+    all_active_clients: set[str] = {
+        k for k in coordinator.data.keys() if k != "wlc_status"
+    }
 
     #  **Step 1: Retrieve all known devices from Home Assistant**
     entity_registry = er.async_get(hass)
-    known_clients = set()
+    known_clients: set[str] = set()
 
-    for entity_entry in entity_registry.entities.values():
+    for entity_entry in list(entity_registry.entities.values()):
         if (
-            getattr(entity_entry, "domain", None) == "device_tracker"
+            entity_entry.entity_id.startswith("device_tracker.")
             and entity_entry.platform == DOMAIN
             and entity_entry.unique_id
         ):
-            known_clients.add(entity_entry.unique_id.lower())
+            # Re-bind orphaned entities (e.g., after config entry re-create) to this entry
+            if entity_entry.config_entry_id != entry.entry_id:
+                entity_registry.async_update_entity(
+                    entity_entry.entity_id,
+                    config_entry_id=entry.entry_id,
+                )
+
+            uid = entity_entry.unique_id.lower()
+            known_clients.add(uid)
+            normalized_uid = coordinator._normalize_mac(uid)
+            if normalized_uid:
+                known_clients.add(normalized_uid)
 
     _LOGGER.info(
         "Initial registration: %d active from WLC, %d total to register",
@@ -217,7 +256,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
     all_clients = known_clients | all_active_clients  # Union of both sets
 
     # **Step 3: Register All Clients in Home Assistant**
-    clients_to_add = []
+    clients_to_add: list[CiscoWLCClient] = []
     for mac in all_clients:
         if mac not in tracked_macs:
             clients_to_add.append(CiscoWLCClient(coordinator, mac, coordinator.data.get(mac, {}), enable_new_entities))
@@ -232,18 +271,39 @@ async def async_setup_entry(hass, entry, async_add_entities):
     _LOGGER.info("Cisco 9800 WLC device tracker setup completed")
 
     # Listen for new clients discovered by the coordinator and add entities dynamically
-    def handle_new_clients(coord, new_macs):
+    def handle_new_clients(
+        coord: CiscoWLCUpdateCoordinator,
+        new_macs: Iterable[str],
+    ) -> None:
         if coord is not coordinator:
             return
-        new_entities = []
+        new_entities: list[CiscoWLCClient] = []
         for mac in new_macs:
             if mac in tracked_macs:
                 continue
-            new_entities.append(CiscoWLCClient(coordinator, mac, coordinator.data.get(mac, {}), enable_new_entities))
+            new_entities.append(
+                CiscoWLCClient(
+                    coordinator,
+                    mac,
+                    coordinator.data.get(mac, {}),
+                    enable_new_entities,
+                )
+            )
             tracked_macs.add(mac)
         if new_entities:
             _LOGGER.debug("Adding %d newly discovered client(s)", len(new_entities))
-            async_add_entities(new_entities)
+            hass.add_job(async_add_entities, new_entities)
 
     unsubscribe = async_dispatcher_connect(hass, SIGNAL_NEW_CLIENTS, handle_new_clients)
     entry.async_on_unload(unsubscribe)
+
+
+def _format_timestamp(value: Any) -> str | None:
+    """Normalize timestamp strings to 24-hour local format."""
+
+    if isinstance(value, str):
+        parsed = parse_to_local_datetime(value)
+        if parsed:
+            tz_label = parsed.tzname() or "local"
+            return f"{parsed.strftime('%Y-%m-%d %H:%M:%S')} ({tz_label})"
+    return value if isinstance(value, str) else None

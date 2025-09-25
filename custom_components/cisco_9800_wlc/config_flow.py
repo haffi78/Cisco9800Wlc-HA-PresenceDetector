@@ -1,14 +1,20 @@
+from __future__ import annotations
+
 import logging
 import re
 import aiohttp
 import voluptuous as vol
+from typing import Any, Mapping
+
 from homeassistant import config_entries
-from homeassistant.const import CONF_HOST, CONF_USERNAME, CONF_PASSWORD, CONF_VERIFY_SSL
-from homeassistant.core import callback
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers import entity_registry as er, config_validation as cv
+from homeassistant.helpers import entity_registry as er, config_validation as cv, selector
 from .const import DOMAIN, CONF_IGNORE_SSL, CONF_DETAILED_MACS, CONF_SCAN_INTERVAL
-from .coordinator import DEFAULT_SCAN_INTERVAL
+from .coordinator import DEFAULT_SCAN_INTERVAL, CiscoWLCUpdateCoordinator
 
 MAC_REGEX_COLON = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 MAC_REGEX_HYPHEN = re.compile(r"^([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$")
@@ -16,26 +22,38 @@ MAC_REGEX_CISCO = re.compile(r"^([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}$")
 
 _LOGGER = logging.getLogger(__name__)
 
-DATA_SCHEMA = vol.Schema({
-    vol.Required(CONF_HOST): str,
-    vol.Required(CONF_USERNAME): str,
-    vol.Required(CONF_PASSWORD): str,
-    vol.Optional(CONF_IGNORE_SSL, default=False): bool,
-    vol.Optional("enable_new_entities", default=False): bool 
-})
+DATA_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_HOST): selector.TextSelector(),
+        vol.Required(CONF_USERNAME): selector.TextSelector(),
+        vol.Required(CONF_PASSWORD): selector.TextSelector(
+            selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+        ),
+        vol.Optional(CONF_IGNORE_SSL, default=False): selector.BooleanSelector(),
+        vol.Optional("enable_new_entities", default=False): selector.BooleanSelector(),
+    }
+)
+
+
 class CiscoWLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Cisco 9800 WLC."""
+
     VERSION = 1
 
-    async def async_step_user(self, user_input=None):
+    async def async_step_user(self, user_input: Mapping[str, Any] | None = None) -> FlowResult:
         """Handle the initial step."""
         errors = {}
 
         if user_input is not None:
+            # Abort if this controller is already configured
+            for existing_entry in self._async_current_entries():
+                if existing_entry.data.get(CONF_HOST) == user_input[CONF_HOST]:
+                    return self.async_abort(reason="already_configured")
+
             session = async_get_clientsession(
                 self.hass,
-                verify_ssl=not user_input.get(CONF_IGNORE_SSL, False)
-        )
+                verify_ssl=not user_input.get(CONF_IGNORE_SSL, False),
+            )
             url = f"https://{user_input[CONF_HOST]}/restconf/data"
             auth = aiohttp.BasicAuth(user_input[CONF_USERNAME], user_input[CONF_PASSWORD])
             headers = {"Accept": "application/yang-data+json"}
@@ -74,13 +92,14 @@ class CiscoWLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
             description_placeholders={
                 "setup_hint": "Make sure RESTCONF is enabled on your WLC before proceeding.",
-                "enable_new_entities_label": "Disable new Entities"
+                "connection_hint": "Enter the connection details to your Cisco 9800 WLC.",
+                "new_entities_hint": "Entities are disabled by default to avoid creating trackers automatically.",
             },
         )
 
     @staticmethod
     @callback
-    def async_get_options_flow(config_entry):
+    def async_get_options_flow(config_entry: ConfigEntry) -> CiscoWLCOptionsFlow:
         """Return the options flow to configure existing entries."""
         return CiscoWLCOptionsFlow(config_entry)
 
@@ -98,7 +117,11 @@ def normalize_mac(mac: str) -> str | None:
     return None
 
 
-def _build_mac_options(hass, coordinator, existing: list[str]) -> dict[str, str]:
+def _build_mac_options(
+    hass: HomeAssistant,
+    coordinator: CiscoWLCUpdateCoordinator | None,
+    existing: list[str],
+) -> dict[str, str]:
     """Construct selectable MAC options with friendly labels for the options flow."""
     macs: set[str] = set()
     for mac in existing:
@@ -150,10 +173,10 @@ def _build_mac_options(hass, coordinator, existing: list[str]) -> dict[str, str]
 class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
     """Handle the options flow for Cisco 9800 WLC."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry):
+    def __init__(self, config_entry: ConfigEntry) -> None:
         self._config_entry = config_entry
 
-    async def async_step_init(self, user_input=None):
+    async def async_step_init(self, user_input: Mapping[str, Any] | None = None) -> FlowResult:
         """Present and process the options form."""
         current_enable_new = self._config_entry.options.get("enable_new_entities", False)
         stored_detailed: list[str] = self._config_entry.options.get(CONF_DETAILED_MACS, []) or []
@@ -191,7 +214,7 @@ class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
         if mac_choices:
             schema = vol.Schema(
                 {
-                    vol.Optional("enable_new_entities", default=current_enable_new): bool,
+                    vol.Optional("enable_new_entities", default=current_enable_new): selector.BooleanSelector(),
                     vol.Optional(CONF_SCAN_INTERVAL, default=current_interval): vol.All(vol.Coerce(int), vol.Range(min=5, max=3600)),
                     vol.Optional(CONF_DETAILED_MACS, default=current_detailed): cv.multi_select(mac_choices),
                 }
@@ -199,7 +222,7 @@ class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
         else:
             schema = vol.Schema(
                 {
-                    vol.Optional("enable_new_entities", default=current_enable_new): bool,
+                    vol.Optional("enable_new_entities", default=current_enable_new): selector.BooleanSelector(),
                     vol.Optional(CONF_SCAN_INTERVAL, default=current_interval): vol.All(vol.Coerce(int), vol.Range(min=5, max=3600)),
                 }
             )

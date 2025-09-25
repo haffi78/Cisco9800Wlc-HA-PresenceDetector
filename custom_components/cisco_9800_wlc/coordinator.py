@@ -19,10 +19,12 @@ from homeassistant.helpers.storage import Store
 
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_SCAN_INTERVAL = timedelta(seconds=120)
+CLIENT_LIST_TIMEOUT = 5
+STATUS_TIMEOUT = 3
 DEBUG_LOG_PAYLOADS = False  # set True temporarily when inspecting raw payloads
 DEBUG_PAYLOAD_MAX_CHARS = 10000  # truncate long payloads in debug logs
 ENRICH_RETRY_LIMIT = 3
-ENRICH_DELAY_SECONDS = 0.4
+ENRICH_DELAY_SECONDS = 0.8
 INITIAL_ENRICH_DELAY_SECONDS = 4.0
 
 # Dispatcher signal name used to announce newly discovered clients (MACs)
@@ -52,7 +54,7 @@ def _is_meaningful(value) -> bool:
             return False
     return True
 
-def _parse_to_local_datetime(value):
+def parse_to_local_datetime(value):
     """Parse various time formats to a timezone-aware local datetime.
 
     Supports:
@@ -114,10 +116,10 @@ def _parse_to_local_datetime(value):
 
 
 def format_roaming_time(value):
-    """Format various roaming timestamps to 'HH:MM:SS - DD Month' local time.
+    """Format various roaming timestamps to 'HH:MM:SS - DD Mon' local time.
     Returns empty string when parsing fails or timestamp is zero/invalid.
     """
-    dt = _parse_to_local_datetime(value)
+    dt = parse_to_local_datetime(value)
     if not dt:
         return ""
     # Treat epoch/very old dates as invalid for display
@@ -126,7 +128,7 @@ def format_roaming_time(value):
             return ""
     except Exception:
         return ""
-    return dt.strftime("%H:%M:%S - %d %B")
+    return dt.strftime("%H:%M:%S - %d %b")
 
 def extract_semver_from_version_string(text: str) -> str:
     """Extract x.y.z semantic version from a Cisco version string.
@@ -196,6 +198,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         self._store = Store(self.hass, 1, f"{DOMAIN}_announced_{self.entry_id}")
         self._client_store = Store(self.hass, 1, f"{DOMAIN}_clients_{self.entry_id}")
         self._client_cache_loaded = False
+        self._cached_client_store: dict[str, dict[str, Any]] | None = None
         self._initial_enriched: set[str] = set()
         self._enrich_pending: set[str] = set()
         self._enrich_attempts: dict[str, int] = {}
@@ -204,7 +207,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         # Version fetch cadence control
         self._last_version_fetch: datetime | None = None
         self._version_fetch_interval = timedelta(minutes=10)
-        # One-time INFO summary after first successful full scan
+        # One-time status summary after first successful full scan
         self._first_scan_info_logged = False
         self._last_enrich_status: dict[str, str] = {}
         self._start_enrich_worker()
@@ -252,7 +255,14 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         try:
             data = await self._store.async_load()
             if isinstance(data, list):
-                self._announced_new_clients = set(m.lower() for m in data)
+                normalized: set[str] = set()
+                for item in data:
+                    normalized_mac = self._normalize_mac(item)
+                    if normalized_mac:
+                        normalized.add(normalized_mac)
+                    elif isinstance(item, str):
+                        normalized.add(item.lower())
+                self._announced_new_clients = normalized
             self._announced_loaded = True
         except Exception as err:
             _LOGGER.warning(f"Failed to load announced clients: {err}")
@@ -265,6 +275,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         try:
             data = await self._client_store.async_load()
             if isinstance(data, dict):
+                self._cached_client_store = dict(data)
                 if not isinstance(self.data, dict):
                     self.data = {}
                 self.data.update(data)
@@ -272,6 +283,8 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     mac for mac in data.keys() if isinstance(mac, str)
                 }
                 self._initial_enriched = set(cached_macs)
+            else:
+                self._cached_client_store = {}
         except Exception as err:
             _LOGGER.debug("Failed to load cached client attributes: %s", err)
         finally:
@@ -279,8 +292,23 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
     def _start_enrich_worker(self):
         if self._enrich_worker_task is None or self._enrich_worker_task.done():
-            self._enrich_worker_task = self.hass.loop.create_task(self._enrich_worker())
+            self._enrich_worker_task = self.hass.loop.create_task(
+                self._enrich_worker()
+            )
             _LOGGER.debug("Started enrichment worker")
+        else:
+            self._enrich_worker_task.add_done_callback(lambda _: None)
+
+    async def async_shutdown(self) -> None:
+        """Cancel the enrichment worker cleanly."""
+        if self._enrich_worker_task and not self._enrich_worker_task.done():
+            _LOGGER.debug("Cancelling enrichment worker")
+            self._enrich_worker_task.cancel()
+            try:
+                await self._enrich_worker_task
+            except asyncio.CancelledError:
+                pass
+        self._enrich_worker_task = None
 
     async def _enrich_worker(self):
         """Background task to process queued one-shot enrichment requests."""
@@ -407,14 +435,16 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         """Fetch all connected clients from Cisco WLC but only update tracked entities."""
 
         if self._polling_disabled():
-            _LOGGER.info(" Polling is disabled via options. Skipping automatic update.")
+            _LOGGER.info("Polling is disabled via options. Skipping automatic update.")
             return self.data
 
         try:
             url = f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/sisf-db-mac"
             headers = {"Accept": "application/yang-data+json"}
 
-            async with self.session.get(url, headers=headers, auth=self.auth, timeout=5) as response:
+            async with self.session.get(
+                url, headers=headers, auth=self.auth, timeout=CLIENT_LIST_TIMEOUT
+            ) as response:
                 if response.status == 409:
                     _LOGGER.warning("WLC API Overload (Too many sessions). Skipping this update cycle.")
                     return self.data
@@ -473,6 +503,16 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             # Return the full updated data to the coordinator
             return updated
 
+        except asyncio.TimeoutError as timeout_err:
+            _LOGGER.error(
+                "Timed out after %ss while requesting client list from %s: %s",
+                CLIENT_LIST_TIMEOUT,
+                self.host,
+                timeout_err,
+            )
+            self._set_wlc_status(online=False, push=True)
+            raise UpdateFailed("Timeout while requesting client list") from timeout_err
+
         except UpdateFailed as update_err:
             _LOGGER.error(f"UpdateFailed Error: {update_err}")
             # Already set Offline above; ensure entities are notified
@@ -490,7 +530,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         """Fetch all connected clients from Cisco WLC but only update tracked entities."""
 
         if self._polling_disabled():
-            _LOGGER.info(" Polling is disabled via options. Skipping automatic update.")
+            _LOGGER.info("Polling is disabled via options. Skipping automatic update.")
             return self.data
 
         try:
@@ -499,7 +539,9 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             url = f"{self.api_url}/Cisco-IOS-XE-wireless-client-oper:client-oper-data/sisf-db-mac"
             headers = {"Accept": "application/yang-data+json"}
 
-            async with self.session.get(url, headers=headers, auth=self.auth, timeout=5) as response:
+            async with self.session.get(
+                url, headers=headers, auth=self.auth, timeout=CLIENT_LIST_TIMEOUT
+            ) as response:
                 if response.status == 409:
                     _LOGGER.warning("WLC API Overload (Too many sessions). Skipping this update cycle.")
                     return self.data
@@ -524,28 +566,48 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 _LOGGER.error(f"Unexpected response format from WLC: {data}")
                 raise UpdateFailed("Unexpected response format from WLC")
 
+            #  Build lookup sets for active MACs in both raw and normalized forms
+            active_macs_raw: set[str] = set()
+            active_macs_normalized: set[str] = set()
+            normalized_to_raw: dict[str, str] = {}
+
+            for client in clients:
+                raw_mac = (client.get("mac-addr") or "").strip().lower()
+                if not raw_mac:
+                    continue
+                normalized_mac = self._normalize_mac(raw_mac) or raw_mac
+                active_macs_raw.add(raw_mac)
+                active_macs_normalized.add(normalized_mac)
+                normalized_to_raw.setdefault(normalized_mac, raw_mac)
+
+            if _LOGGER.isEnabledFor(logging.DEBUG) and active_macs_raw:
+                _LOGGER.debug(
+                    "WLC reported %d active client(s): %s",
+                    len(active_macs_raw),
+                    ", ".join(sorted(active_macs_raw)),
+                )
+
             #  Get enabled tracked MACs (entities enabled in HA)
             enabled_tracked_macs = self.get_enabled_tracked_macs()
-            #  Get all registered MACs (includes disabled entries)
+            #  Get all registered MACs (includes disabled entries) in normalized form
             registered_macs = self.get_registered_macs()
             detailed_macs, detailed_explicit = self.get_detailed_macs()
             if not detailed_macs and not detailed_explicit:
                 detailed_macs = enabled_tracked_macs
 
-            #  Extract MACs seen in the latest WLC scan
-            active_macs = {client.get("mac-addr", "").lower() for client in clients if client.get("mac-addr")}
-            if _LOGGER.isEnabledFor(logging.DEBUG) and active_macs:
-                _LOGGER.debug(
-                    "WLC reported %d active client(s): %s",
-                    len(active_macs),
-                    ", ".join(sorted(active_macs)),
-                )
-
             #  Find MACs that are both in the detailed set and currently active
-            detailed_and_active_macs = detailed_macs & active_macs
+            detailed_and_active_normalized = detailed_macs & active_macs_normalized
+            detailed_and_active_macs = {
+                normalized_to_raw.get(mac, mac) for mac in detailed_and_active_normalized
+            }
 
             # New clients = active but not yet in registry, and not previously announced
-            new_clients = (active_macs - registered_macs) - self._announced_new_clients
+            new_clients_normalized = (
+                active_macs_normalized - registered_macs - self._announced_new_clients
+            )
+            new_clients = {
+                normalized_to_raw.get(mac, mac) for mac in new_clients_normalized
+            }
             if new_clients:
                 _LOGGER.info(
                     "Discovered %d new client(s) not yet enabled in HA: %s",
@@ -553,17 +615,17 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     ", ".join(sorted(new_clients)),
                 )
                 async_dispatcher_send(self.hass, SIGNAL_NEW_CLIENTS, self, list(new_clients))
-                # Remember we've announced these already this session
-                self._announced_new_clients.update(new_clients)
+                # Remember we've announced these already this session (store normalized to avoid format drift)
+                self._announced_new_clients.update(new_clients_normalized)
                 # Persist to storage
                 try:
                     await self._store.async_save(sorted(self._announced_new_clients))
                 except Exception as err:
                     _LOGGER.debug("Failed to persist announced clients: %s", err)
 
-            # Queue one-time detailed fetches for unseen MACs
+            # Queue one-time detailed fetches for unseen MACs (raw identifiers)
             enrich_targets = {
-                mac for mac in active_macs
+                mac for mac in active_macs_raw
                 if mac not in self._initial_enriched and mac not in self._enrich_pending
             }
             if new_clients:
@@ -577,14 +639,14 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             client_data: dict[str, dict[str, Any]] = {}
 
             for client in clients:
-                mac = client.get("mac-addr", "").lower()
-                if not mac:
+                mac_raw = (client.get("mac-addr") or "").strip().lower()
+                if not mac_raw:
                     continue  # Skip invalid MACs
 
                 ip_entry = client.get("ipv4-binding", {}).get("ip-key", {})
                 ipv4_address = ip_entry.get("ip-addr", "N/A")
 
-                client_data[mac] = {
+                client_data[mac_raw] = {
                     "IP Address": ipv4_address,
                     "last_seen": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
                     "connected": True,
@@ -607,7 +669,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 batch_results = await asyncio.gather(*batch, return_exceptions=True)
                 attribute_results.extend(batch_results)
                 if i + batch_size < len(tasks):
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.5)
 
             #  Merge attributes into the latest client_data (only for tracked MACs)
             for mac, attributes in zip(detailed_and_active_list, attribute_results):
@@ -638,7 +700,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 merged_client_data[mac] = merged
 
             # Carry forward last-known attributes for clients that dropped offline
-            offline_macs = set(existing_clients) - active_macs
+            offline_macs = set(existing_clients) - active_macs_raw
             for mac in offline_macs:
                 preserved = dict(existing_clients[mac])
                 preserved["connected"] = False
@@ -672,9 +734,11 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
             # Persist last-known attributes (excluding controller status)
             try:
-                existing_cache = await self._client_store.async_load() or {}
-                if not isinstance(existing_cache, dict):
-                    existing_cache = {}
+                existing_cache = (
+                    dict(self._cached_client_store)
+                    if isinstance(self._cached_client_store, dict)
+                    else {}
+                )
                 merged_cache: dict[str, dict] = {}
                 for mac, attrs in updated.items():
                     if mac == "wlc_status" or not isinstance(attrs, dict):
@@ -688,6 +752,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 await self._client_store.async_save(
                     merged_cache
                 )
+                self._cached_client_store = dict(merged_cache)
                 self._initial_enriched.update(merged_cache.keys())
             except Exception as err:
                 _LOGGER.debug("Failed to store client snapshot: %s", err)
@@ -702,12 +767,22 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             if not self._first_scan_info_logged:
                 _LOGGER.info(
                     "Initial WLC scan complete: %d active client(s), %d detailed polling, %d new",
-                    len(active_macs), len(detailed_and_active_macs), len(new_clients),
+                    len(active_macs_raw), len(detailed_and_active_macs), len(new_clients),
                 )
                 self._first_scan_info_logged = True
 
             # Return the full updated data to the coordinator
             return updated
+
+        except asyncio.TimeoutError as timeout_err:
+            _LOGGER.error(
+                "Timed out after %ss while requesting client list from %s: %s",
+                CLIENT_LIST_TIMEOUT,
+                self.host,
+                timeout_err,
+            )
+            self._set_wlc_status(online=False, push=True)
+            raise UpdateFailed("Timeout while requesting client list") from timeout_err
 
         except UpdateFailed as update_err:
             _LOGGER.error(f"UpdateFailed Error: {update_err}")
@@ -735,8 +810,9 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 return
 
             try:
-               
-                 async with self.session.get(status_url, headers=headers, auth=self.auth, timeout=3) as response:
+                async with self.session.get(
+                    status_url, headers=headers, auth=self.auth, timeout=STATUS_TIMEOUT
+                ) as response:
                     
                     if response.status != 200:
                         response_text = await response.text()
@@ -765,8 +841,13 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     self.async_set_updated_data(self.data)
                     
 
-            except asyncio.TimeoutError:
-                _LOGGER.debug("WLC status request timed out")
+            except asyncio.TimeoutError as timeout_err:
+                _LOGGER.warning(
+                    "Cisco 9800 WLC status request to %s timed out after %ss: %s",
+                    self.host,
+                    STATUS_TIMEOUT,
+                    timeout_err,
+                )
                 # Keep previous connectivity status; do not mark Offline based on version timeout
                 
             except Exception as e:
@@ -814,9 +895,11 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             return
 
         try:
-            existing_cache = await self._client_store.async_load() or {}
-            if not isinstance(existing_cache, dict):
-                existing_cache = {}
+            existing_cache = (
+                dict(self._cached_client_store)
+                if isinstance(self._cached_client_store, dict)
+                else {}
+            )
 
             merged = dict(existing_cache.get(mac, {}))
             for key, value in attrs.items():
@@ -826,6 +909,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
             existing_cache[mac] = merged
             await self._client_store.async_save(existing_cache)
+            self._cached_client_store = dict(existing_cache)
         except Exception as err:
             _LOGGER.debug("Failed to persist snapshot for %s: %s", mac, err)
 
@@ -845,8 +929,13 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     macs.add(normalized_mac)
         return macs
 
-    def get_registered_macs(self):
-        """MACs of all entities registered for this integration (enabled or disabled)."""
+    def get_registered_macs(self, *, normalized: bool = True):
+        """MACs of all entities registered for this integration (enabled or disabled).
+
+        When normalized=True (default), MACs are returned in colon-separated form to
+        match options flow expectations. When False, the raw unique_id values are
+        returned in lower-case to align with coordinator data keys.
+        """
         entity_registry = er.async_get(self.hass)
         macs: set[str] = set()
         for entity_id, entity in entity_registry.entities.items():
@@ -855,9 +944,15 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 and entity.platform == DOMAIN
                 and entity.unique_id
             ):
-                normalized_mac = self._normalize_mac(entity.unique_id)
+                raw_mac = entity.unique_id.lower()
+                if not normalized:
+                    macs.add(raw_mac)
+                    continue
+                normalized_mac = self._normalize_mac(raw_mac)
                 if normalized_mac:
                     macs.add(normalized_mac)
+                else:
+                    macs.add(raw_mac)
         return macs
 ############################################################################################################
 
@@ -1004,7 +1099,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                         if isinstance(mobility_entries, list):
                             # Sort by parsed datetime descending
                             def _roam_sort_key(e):
-                                dt = _parse_to_local_datetime(e.get("ms-assoc-time"))
+                                dt = parse_to_local_datetime(e.get("ms-assoc-time"))
                                 return dt.timestamp() if dt else 0.0
                             mobility_entries.sort(key=_roam_sort_key, reverse=True)
 

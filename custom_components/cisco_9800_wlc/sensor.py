@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 
+from typing import cast
+
 from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -35,6 +37,7 @@ class CiscoWLCVersionSensor(
 
     entity_description = VERSION_DESCRIPTION
     _attr_should_poll = False
+    _attr_has_entity_name = True
 
     def __init__(
         self, coordinator: CiscoWLCUpdateCoordinator, config_entry: ConfigEntry
@@ -54,7 +57,7 @@ class CiscoWLCVersionSensor(
 
     @property
     def available(self) -> bool:
-        return True
+        return bool(self.coordinator.last_update_success)
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -79,7 +82,7 @@ class CiscoWLCVersionSensor(
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities
 ) -> None:
-    coordinator = hass.data[DOMAIN].get(entry.entry_id)
+    coordinator = cast(CiscoWLCUpdateCoordinator | None, entry.runtime_data)
     if not coordinator:
         _LOGGER.error(
             "Failed to find WLC coordinator for entry %s. Aborting sensor setup.",

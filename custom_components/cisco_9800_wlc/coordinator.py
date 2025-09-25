@@ -16,6 +16,7 @@ from homeassistant.const import CONF_HOST, CONF_USERNAME, CONF_PASSWORD
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
+from homeassistant.exceptions import ConfigEntryAuthFailed
 
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_SCAN_INTERVAL = timedelta(seconds=120)
@@ -337,6 +338,10 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     else:
                         _LOGGER.warning("One-shot enrich for %s did not return detailed data after %d attempts", mac, attempts)
                         self._enrich_attempts.pop(mac, None)
+            except ConfigEntryAuthFailed:
+                self._enrich_pending.discard(mac)
+                self._enrich_queue.task_done()
+                raise
             except Exception as err:  # pragma: no cover - defensive
                 attempts = self._enrich_attempts.get(mac, 0) + 1
                 self._enrich_attempts[mac] = attempts
@@ -415,6 +420,8 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     return status, None, text
             else:
                 text = await response.text()
+                if status == 401:
+                    raise ConfigEntryAuthFailed("Invalid credentials")
                 if _LOGGER.isEnabledFor(logging.DEBUG) and DEBUG_LOG_PAYLOADS:
                     trimmed = text if len(text) <= DEBUG_PAYLOAD_MAX_CHARS else text[:DEBUG_PAYLOAD_MAX_CHARS] + " …(truncated)"
                     _LOGGER.debug("GET %s -> %s TEXT: %s", url, status, trimmed)
@@ -448,6 +455,15 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 if response.status == 409:
                     _LOGGER.warning("WLC API Overload (Too many sessions). Skipping this update cycle.")
                     return self.data
+
+                if response.status == 401:
+                    response_text = await response.text()
+                    _LOGGER.error(
+                        "Authentication failed fetching client list: HTTP 401 - %s",
+                        response_text,
+                    )
+                    self._set_wlc_status(online=False, push=True)
+                    raise ConfigEntryAuthFailed("Invalid credentials")
 
                 if response.status != 200:
                     response_text = await response.text()
@@ -545,6 +561,15 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 if response.status == 409:
                     _LOGGER.warning("WLC API Overload (Too many sessions). Skipping this update cycle.")
                     return self.data
+
+                if response.status == 401:
+                    response_text = await response.text()
+                    _LOGGER.error(
+                        "Authentication failed fetching client list: HTTP 401 - %s",
+                        response_text,
+                    )
+                    self._set_wlc_status(online=False, push=True)
+                    raise ConfigEntryAuthFailed("Invalid credentials")
 
                 if response.status != 200:
                     response_text = await response.text()
@@ -667,6 +692,9 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             for i in range(0, len(tasks), batch_size):
                 batch = tasks[i:i + batch_size]
                 batch_results = await asyncio.gather(*batch, return_exceptions=True)
+                for result in batch_results:
+                    if isinstance(result, ConfigEntryAuthFailed):
+                        raise result
                 attribute_results.extend(batch_results)
                 if i + batch_size < len(tasks):
                     await asyncio.sleep(0.5)
@@ -813,7 +841,14 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 async with self.session.get(
                     status_url, headers=headers, auth=self.auth, timeout=STATUS_TIMEOUT
                 ) as response:
-                    
+                    if response.status == 401:
+                        response_text = await response.text()
+                        _LOGGER.error(
+                            "Authentication failed fetching WLC status: HTTP 401 - %s",
+                            response_text,
+                        )
+                        raise ConfigEntryAuthFailed("Invalid credentials")
+
                     if response.status != 200:
                         response_text = await response.text()
                         _LOGGER.debug("HTTP %s: Error fetching WLC status - %s", response.status, response_text)

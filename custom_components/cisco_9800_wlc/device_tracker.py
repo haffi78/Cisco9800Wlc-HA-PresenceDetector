@@ -6,6 +6,7 @@ from typing import Any, Iterable, cast
 
 from homeassistant.components.device_tracker import ScannerEntity
 from homeassistant.components.device_tracker.const import SourceType
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
@@ -42,12 +43,19 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
         self.data = data or self.coordinator.data.get(self.mac, {})
         self._attr_should_poll = False  #  Polling is not needed
         self._enable_by_default = enable_by_default  #  Store user preference
-      
+        self._attr_has_entity_name = True
+
 
     @property
     def source_type(self) -> SourceType:
         """Indicate this is a router-based tracker."""
         return SourceType.ROUTER
+
+    @property
+    def available(self) -> bool:
+        """Return if coordinator has delivered a successful update recently."""
+
+        return bool(self.coordinator.last_update_success)
 
     @property
     def unique_id(self) -> str:
@@ -193,8 +201,8 @@ async def async_setup_entry(
     """Set up Cisco 9800 WLC device tracker from a config entry."""
     _LOGGER.info("Setting up Cisco 9800 WLC device tracker platform")
 
-    data = hass.data[DOMAIN]
-    coordinator = cast(CiscoWLCUpdateCoordinator | None, data.get(entry.entry_id))
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    coordinator = cast(CiscoWLCUpdateCoordinator | None, entry.runtime_data)
     if coordinator is None:
         _LOGGER.error(" Failed to find WLC coordinator for entry %s. Aborting setup.", entry.entry_id)
         return
@@ -208,7 +216,7 @@ async def async_setup_entry(
         _LOGGER.debug("Polling is enabled; using coordinator interval: %s", coordinator.update_interval)
 
     # Track which MACs have entities already added
-    tracked_entries = data.setdefault("tracked_macs", {})
+    tracked_entries = domain_data.setdefault("tracked_macs", {})
     tracked_entries = cast(dict[str, set[str]], tracked_entries)
     tracked_macs = set()
     tracked_entries[entry.entry_id] = tracked_macs

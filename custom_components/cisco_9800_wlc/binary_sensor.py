@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+from typing import cast
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
@@ -39,6 +40,7 @@ class CiscoWLCStatusBinarySensor(
 
     entity_description = BINARY_SENSOR_DESCRIPTION
     _attr_should_poll = False
+    _attr_has_entity_name = True
 
     def __init__(
         self, coordinator: CiscoWLCUpdateCoordinator, config_entry: ConfigEntry
@@ -46,7 +48,7 @@ class CiscoWLCStatusBinarySensor(
         super().__init__(coordinator)
         self._entry = config_entry
         self._attr_unique_id = f"{DOMAIN}_controller_status"
-        self._attr_name = "Cisco 9800 WLC"
+        self._attr_name = None
 
     @property
     def is_on(self) -> bool:
@@ -59,7 +61,7 @@ class CiscoWLCStatusBinarySensor(
 
     @property
     def available(self) -> bool:
-        return True
+        return bool(self.coordinator.last_update_success)
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -84,7 +86,7 @@ class CiscoWLCStatusBinarySensor(
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities
 ) -> None:
-    coordinator = hass.data[DOMAIN].get(entry.entry_id)
+    coordinator = cast(CiscoWLCUpdateCoordinator | None, entry.runtime_data)
     if not coordinator:
         _LOGGER.error(
             "Failed to find WLC coordinator for entry %s. Aborting binary_sensor setup.",

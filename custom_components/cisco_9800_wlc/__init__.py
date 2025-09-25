@@ -1,11 +1,15 @@
 from __future__ import annotations
 import logging
+from typing import cast
+
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
+
 from .coordinator import CiscoWLCUpdateCoordinator
 from .const import DOMAIN
 from . import system_health
+
 PLATFORMS = [Platform.DEVICE_TRACKER, Platform.BINARY_SENSOR, Platform.SENSOR]
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,7 +35,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.info("Setting up Cisco 9800 WLC entry %s", entry.entry_id)
 
     # Ensure DOMAIN storage exists
-    hass.data.setdefault(DOMAIN, {})
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    domain_data.setdefault("tracked_macs", {})
 
     # Create the coordinator
     coordinator = CiscoWLCUpdateCoordinator(
@@ -47,8 +52,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Fetch initial data
     await coordinator.async_config_entry_first_refresh()
 
-    # Store the coordinator in Home Assistant's data
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    # Store runtime data on the entry for platform access
+    entry.runtime_data = coordinator
 
     # Watch for options updates
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
@@ -60,7 +65,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.info("Unloading Cisco 9800 WLC entry %s", entry.entry_id)
-    coordinator: CiscoWLCUpdateCoordinator | None = hass.data[DOMAIN].get(entry.entry_id)
+    coordinator = cast(CiscoWLCUpdateCoordinator | None, entry.runtime_data)
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
         if isinstance(coordinator, CiscoWLCUpdateCoordinator):
@@ -68,5 +73,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         tracked = hass.data[DOMAIN].get("tracked_macs")
         if isinstance(tracked, dict):
             tracked.pop(entry.entry_id, None)
-        hass.data[DOMAIN].pop(entry.entry_id, None)
+        entry.runtime_data = None
     return unloaded

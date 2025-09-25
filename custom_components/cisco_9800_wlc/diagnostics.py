@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.config_entries import ConfigEntry
@@ -25,7 +25,9 @@ async def async_get_config_entry_diagnostics(
 ) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
 
-    coordinator: CiscoWLCUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator = cast(CiscoWLCUpdateCoordinator | None, entry.runtime_data)
+    if coordinator is None:
+        return {"controller": {"status": "not_loaded"}}
     coordinator_data = coordinator.data if isinstance(coordinator.data, dict) else {}
 
     clients: dict[str, Any] = {}

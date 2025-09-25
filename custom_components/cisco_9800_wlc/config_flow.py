@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import aiohttp
 import voluptuous as vol
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
 from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntry
@@ -21,6 +22,26 @@ MAC_REGEX_HYPHEN = re.compile(r"^([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$")
 MAC_REGEX_CISCO = re.compile(r"^([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}$")
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class CiscoWLCFlowError(Exception):
+    """Base exception for config flow validation."""
+
+
+class CannotConnect(CiscoWLCFlowError):
+    """Raised when the controller cannot be reached."""
+
+
+class InvalidAuth(CiscoWLCFlowError):
+    """Raised when authentication fails."""
+
+
+class SSLError(CiscoWLCFlowError):
+    """Raised when certificate validation fails."""
+
+
+class UnknownError(CiscoWLCFlowError):
+    """Raised for unexpected failures."""
 
 DATA_SCHEMA = vol.Schema(
     {
@@ -40,51 +61,83 @@ class CiscoWLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
+    def __init__(self) -> None:
+        self._reauth_entry_id: str | None = None
+        self._reauth_entry: ConfigEntry | None = None
+        self._reauth_defaults: dict[str, Any] = {}
+
+    async def _async_validate_credentials(
+        self,
+        *,
+        host: str,
+        username: str,
+        password: str,
+        ignore_ssl: bool,
+    ) -> None:
+        """Validate that the provided credentials can reach the controller."""
+
+        session = async_get_clientsession(
+            self.hass,
+            verify_ssl=not ignore_ssl,
+        )
+        url = f"https://{host}/restconf/data"
+        auth = aiohttp.BasicAuth(username, password)
+        headers = {"Accept": "application/yang-data+json"}
+
+        try:
+            async with session.get(url, auth=auth, headers=headers) as response:
+                _LOGGER.debug("WLC API Response Code: %s", response.status)
+                if response.status == 401:
+                    raise InvalidAuth
+                if response.status != 200:
+                    raise CannotConnect
+        except aiohttp.ClientConnectorCertificateError as err:
+            raise SSLError from err
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise CannotConnect from err
+        except Exception as err:  # pragma: no cover - defensive guard
+            raise UnknownError from err
+
     async def async_step_user(self, user_input: Mapping[str, Any] | None = None) -> FlowResult:
         """Handle the initial step."""
         errors = {}
 
         if user_input is not None:
-            # Abort if this controller is already configured
-            for existing_entry in self._async_current_entries():
-                if existing_entry.data.get(CONF_HOST) == user_input[CONF_HOST]:
-                    return self.async_abort(reason="already_configured")
-
-            session = async_get_clientsession(
-                self.hass,
-                verify_ssl=not user_input.get(CONF_IGNORE_SSL, False),
-            )
-            url = f"https://{user_input[CONF_HOST]}/restconf/data"
-            auth = aiohttp.BasicAuth(user_input[CONF_USERNAME], user_input[CONF_PASSWORD])
-            headers = {"Accept": "application/yang-data+json"}
-
+            ignore_ssl = user_input.get(CONF_IGNORE_SSL, False)
             try:
-                async with session.get(url, auth=auth, headers=headers) as response:
-                    _LOGGER.debug("WLC API Response Code: %s", response.status)
-
-                    if response.status == 401:
-                        errors["base"] = "invalid_auth"
-                    elif response.status != 200:
-                        errors["base"] = "cannot_connect"
-                    else:
-                        return self.async_create_entry(
-                            title=user_input[CONF_HOST],
-                            data=user_input,
-                            options={
-                                "enable_new_entities": user_input.get("enable_new_entities", False),
-                                CONF_DETAILED_MACS: [],
-                            },
-                        )
-
-            except aiohttp.ClientConnectorCertificateError:
-                _LOGGER.error("SSL Certificate Verification Failed. Try enabling 'Ignore Self-Signed SSL'.")
+                await self._async_validate_credentials(
+                    host=user_input[CONF_HOST],
+                    username=user_input[CONF_USERNAME],
+                    password=user_input[CONF_PASSWORD],
+                    ignore_ssl=ignore_ssl,
+                )
+            except InvalidAuth:
+                errors["base"] = "invalid_auth"
+            except SSLError:
                 errors["base"] = "ssl_error"
-            except aiohttp.ClientError as e:
-                _LOGGER.error("Client error connecting to Cisco 9800 WLC: %s", e)
+            except CannotConnect:
                 errors["base"] = "cannot_connect"
-            except Exception as e:
-                _LOGGER.error("Unexpected error: %s", e)
+            except UnknownError:
                 errors["base"] = "unknown"
+            else:
+                await self.async_set_unique_id(user_input[CONF_HOST])
+                self._abort_if_unique_id_configured()
+
+                data = {
+                    CONF_HOST: user_input[CONF_HOST],
+                    CONF_USERNAME: user_input[CONF_USERNAME],
+                    CONF_PASSWORD: user_input[CONF_PASSWORD],
+                    CONF_IGNORE_SSL: ignore_ssl,
+                }
+                options = {
+                    "enable_new_entities": user_input.get("enable_new_entities", False),
+                    CONF_DETAILED_MACS: [],
+                }
+                return self.async_create_entry(
+                    title=user_input[CONF_HOST],
+                    data=data,
+                    options=options,
+                )
 
         return self.async_show_form(
             step_id="user",
@@ -95,6 +148,93 @@ class CiscoWLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 "connection_hint": "Enter the connection details to your Cisco 9800 WLC.",
                 "new_entities_hint": "Entities are disabled by default to avoid creating trackers automatically.",
             },
+        )
+
+    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
+        """Start a reauthentication flow when credentials become invalid."""
+
+        self._reauth_entry_id = self.context.get("entry_id")
+        if self._reauth_entry_id:
+            self._reauth_entry = self.hass.config_entries.async_get_entry(self._reauth_entry_id)
+        else:
+            self._reauth_entry = None
+
+        host = entry_data.get(CONF_HOST, "")
+        self._reauth_defaults = {
+            CONF_HOST: host,
+            CONF_USERNAME: entry_data.get(CONF_USERNAME, ""),
+            CONF_IGNORE_SSL: entry_data.get(CONF_IGNORE_SSL, False),
+        }
+
+        self.context["title_placeholders"] = {"host": host}
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: Mapping[str, Any] | None = None
+    ) -> FlowResult:
+        """Ask the user for new credentials during reauthentication."""
+
+        errors: dict[str, str] = {}
+        defaults = self._reauth_defaults
+        data_schema = vol.Schema(
+            {
+                vol.Required(
+                    CONF_USERNAME,
+                    default=defaults.get(CONF_USERNAME, ""),
+                ): selector.TextSelector(),
+                vol.Required(CONF_PASSWORD): selector.TextSelector(
+                    selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+                ),
+                vol.Optional(
+                    CONF_IGNORE_SSL,
+                    default=defaults.get(CONF_IGNORE_SSL, False),
+                ): selector.BooleanSelector(),
+            }
+        )
+
+        if user_input is not None:
+            username = user_input[CONF_USERNAME]
+            password = user_input[CONF_PASSWORD]
+            ignore_ssl = user_input.get(CONF_IGNORE_SSL, defaults.get(CONF_IGNORE_SSL, False))
+            host = defaults.get(CONF_HOST, "")
+
+            try:
+                await self._async_validate_credentials(
+                    host=host,
+                    username=username,
+                    password=password,
+                    ignore_ssl=ignore_ssl,
+                )
+            except InvalidAuth:
+                errors["base"] = "invalid_auth"
+            except SSLError:
+                errors["base"] = "ssl_error"
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
+            except UnknownError:
+                errors["base"] = "unknown"
+            else:
+                entry = self._reauth_entry
+                if entry is None and self._reauth_entry_id:
+                    entry = self.hass.config_entries.async_get_entry(self._reauth_entry_id)
+                if entry is None:
+                    return self.async_abort(reason="unknown")
+
+                data_updates = {
+                    CONF_USERNAME: username,
+                    CONF_PASSWORD: password,
+                    CONF_IGNORE_SSL: ignore_ssl,
+                }
+                return self.async_update_reload_and_abort(
+                    entry,
+                    data_updates=data_updates,
+                    reason="reauth_successful",
+                )
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=data_schema,
+            errors=errors,
         )
 
     @staticmethod
@@ -183,7 +323,7 @@ class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
         current_detailed = [mac for mac in (normalize_mac(m) for m in stored_detailed) if mac]
         current_interval = int(self._config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL.total_seconds()))
 
-        coordinator = self.hass.data.get(DOMAIN, {}).get(self._config_entry.entry_id)
+        coordinator = cast(CiscoWLCUpdateCoordinator | None, self._config_entry.runtime_data)
         mac_choices = _build_mac_options(self.hass, coordinator, current_detailed)
 
         if user_input is not None:

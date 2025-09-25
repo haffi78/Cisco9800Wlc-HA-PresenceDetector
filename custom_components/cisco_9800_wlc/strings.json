@@ -39,12 +39,12 @@
     "entity": {
         "binary_sensor": {
             "controller_status": {
-                "name": "Cisco 9800 WLC Status"
+                "name": "Controller Status"
             }
         },
         "sensor": {
             "software_version": {
-                "name": "Cisco 9800 WLC Software Version"
+                "name": "Software Version"
             }
         }
     }

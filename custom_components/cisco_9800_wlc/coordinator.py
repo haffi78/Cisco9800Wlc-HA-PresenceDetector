@@ -160,7 +160,13 @@ MAC_REGEX_CISCO = re.compile(r"^([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}$")  # 001a.2
 class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
     """Coordinator to manage Cisco 9800 WLC API polling."""
 
-    def __init__(self, hass: HomeAssistant, config: dict, entry_id: str, options: dict | None = None):
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config: dict,
+        entry_id: str,
+        options: dict | None = None,
+    ):
         self.entry_id = entry_id
         self._options = options or {}
         polling_enabled = not self._options.get("disable_polling", False)
@@ -903,7 +909,9 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             return ":".join(flat[i:i+2] for i in range(0, 12, 2))
         return None
 
-    def _merge_client_attributes(self, existing: dict[str, Any] | None, updates: dict[str, Any]) -> dict[str, Any]:
+    def _merge_client_attributes(
+        self, existing: dict[str, Any] | None, updates: dict[str, Any]
+    ) -> dict[str, Any]:
         """Merge new per-scan data with cached attributes without dropping useful values."""
         always_replace = {
             "connected",

@@ -62,8 +62,8 @@ class CiscoWLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
     def __init__(self) -> None:
-        self._reauth_entry_id: str | None = None
-        self._reauth_entry: ConfigEntry | None = None
+        self._pending_reauth_entry_id: str | None = None
+        self._pending_reauth_entry: ConfigEntry | None = None
         self._reauth_defaults: dict[str, Any] = {}
 
     async def _async_validate_credentials(
@@ -98,7 +98,9 @@ class CiscoWLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except Exception as err:  # pragma: no cover - defensive guard
             raise UnknownError from err
 
-    async def async_step_user(self, user_input: Mapping[str, Any] | None = None) -> FlowResult:
+    async def async_step_user(
+        self, user_input: Mapping[str, Any] | None = None
+    ) -> FlowResult:
         """Handle the initial step."""
         errors = {}
 
@@ -153,11 +155,13 @@ class CiscoWLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
         """Start a reauthentication flow when credentials become invalid."""
 
-        self._reauth_entry_id = self.context.get("entry_id")
-        if self._reauth_entry_id:
-            self._reauth_entry = self.hass.config_entries.async_get_entry(self._reauth_entry_id)
+        self._pending_reauth_entry_id = self.context.get("entry_id")
+        if self._pending_reauth_entry_id:
+            self._pending_reauth_entry = self.hass.config_entries.async_get_entry(
+                self._pending_reauth_entry_id
+            )
         else:
-            self._reauth_entry = None
+            self._pending_reauth_entry = None
 
         host = entry_data.get(CONF_HOST, "")
         self._reauth_defaults = {
@@ -214,9 +218,11 @@ class CiscoWLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except UnknownError:
                 errors["base"] = "unknown"
             else:
-                entry = self._reauth_entry
-                if entry is None and self._reauth_entry_id:
-                    entry = self.hass.config_entries.async_get_entry(self._reauth_entry_id)
+                entry = self._pending_reauth_entry
+                if entry is None and self._pending_reauth_entry_id:
+                    entry = self.hass.config_entries.async_get_entry(
+                        self._pending_reauth_entry_id
+                    )
                 if entry is None:
                     return self.async_abort(reason="unknown")
 
@@ -316,14 +322,18 @@ class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
     def __init__(self, config_entry: ConfigEntry) -> None:
         self._config_entry = config_entry
 
-    async def async_step_init(self, user_input: Mapping[str, Any] | None = None) -> FlowResult:
+    async def async_step_init(
+        self, user_input: Mapping[str, Any] | None = None
+    ) -> FlowResult:
         """Present and process the options form."""
         current_enable_new = self._config_entry.options.get("enable_new_entities", False)
         stored_detailed: list[str] = self._config_entry.options.get(CONF_DETAILED_MACS, []) or []
         current_detailed = [mac for mac in (normalize_mac(m) for m in stored_detailed) if mac]
         current_interval = int(self._config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL.total_seconds()))
 
-        coordinator = cast(CiscoWLCUpdateCoordinator | None, self._config_entry.runtime_data)
+        coordinator = cast(
+            CiscoWLCUpdateCoordinator | None, self._config_entry.runtime_data
+        )
         mac_choices = _build_mac_options(self.hass, coordinator, current_detailed)
 
         if user_input is not None:

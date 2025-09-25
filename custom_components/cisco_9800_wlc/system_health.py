@@ -24,7 +24,9 @@ def async_register(
         system_health.async_register_info(hass, DOMAIN, async_info)
 
 
-async def async_info(hass: HomeAssistant, config_entry: ConfigEntry | None = None) -> dict[str, Any]:
+async def async_info(
+    hass: HomeAssistant, config_entry: ConfigEntry | None = None
+) -> dict[str, Any]:
     """Return diagnostic information for system health."""
 
     coordinator: CiscoWLCUpdateCoordinator | None = None

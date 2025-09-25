@@ -8,7 +8,6 @@ from homeassistant.const import Platform
 
 from .coordinator import CiscoWLCUpdateCoordinator
 from .const import DOMAIN
-from . import system_health
 
 PLATFORMS = [Platform.DEVICE_TRACKER, Platform.BINARY_SENSOR, Platform.SENSOR]
 _LOGGER = logging.getLogger(__name__)
@@ -28,7 +27,6 @@ def setup(hass: HomeAssistant, config: dict) -> bool:
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     domain_data = hass.data.setdefault(DOMAIN, {})
     _LOGGER.info("Asynchronous setup of Cisco 9800 WLC integration")
-    await system_health.async_register(hass)
     return True
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

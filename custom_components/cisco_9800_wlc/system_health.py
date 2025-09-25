@@ -11,10 +11,17 @@ from .const import DOMAIN
 from .coordinator import CiscoWLCUpdateCoordinator
 
 
-async def async_register(hass: HomeAssistant) -> None:
+def async_register(
+    hass: HomeAssistant,
+    registration: system_health.SystemHealthRegistration | None = None,
+) -> None:
     """Register the system health info callback for this integration."""
 
-    system_health.async_register_info(hass, DOMAIN, async_info)
+    if registration is not None:
+        registration.async_register_info(async_info)
+    else:
+        # Fallback for older Home Assistant cores that still expect manual registration
+        system_health.async_register_info(hass, DOMAIN, async_info)
 
 
 async def async_info(hass: HomeAssistant, config_entry: ConfigEntry | None = None) -> dict[str, Any]:

@@ -1,15 +1,19 @@
 {
     "title": "Cisco 9800 WLC",
     "config": {
+        "abort": {
+            "already_configured": "This Cisco 9800 WLC is already configured."
+        },
         "step": {
             "user": {
                 "title": "Setup Cisco 9800 WLC",
-                "description": "Make sure RESTCONF is enabled on your WLC before proceeding.\n\nEnter the connection details to your Cisco 9800 WLC. Also note entites come disabled by default.\n\n Due to High load else of scanning be careful.",
+                "description": "{setup_hint}\n\n{connection_hint}\n\n{new_entities_hint}",
                 "data": {
                     "host": "WLC IP Address",
                     "username": "Username",
                     "password": "Password",
-                    "ignore_ssl": "Ignore Self-Signed SSL Certificates"
+                    "ignore_ssl": "Ignore Self-Signed SSL Certificates",
+                    "enable_new_entities": "Disable newly discovered devices by default"
                 },
                 "errors": {
                     "cannot_connect": "Unable to connect to Cisco 9800 WLC. Check the IP address and credentials.",
@@ -26,6 +30,18 @@
                     "data": {
                         "enable_new_entities": "Disable newly discovered devices by default"
                     }
+                }
+            }
+        },
+        "entity": {
+            "binary_sensor": {
+                "controller_status": {
+                    "name": "Cisco 9800 WLC Status"
+                }
+            },
+            "sensor": {
+                "software_version": {
+                    "name": "Cisco 9800 WLC Software Version"
                 }
             }
         }

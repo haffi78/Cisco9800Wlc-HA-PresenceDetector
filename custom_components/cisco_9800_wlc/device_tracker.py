@@ -43,6 +43,7 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
         self.data = data or self.coordinator.data.get(self.mac, {})
         self._attr_should_poll = False  #  Polling is not needed
         self._enable_by_default = enable_by_default  #  Store user preference
+        self._attr_name = self._current_friendly_name()
 
 
     @property
@@ -178,33 +179,42 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
             return name_candidate.strip()
         return self.mac
 
-    def _current_friendly_name(self) -> str:
-        base = self._base_name()
-        if base == self.mac:
-            return base
+    def _mac_suffix(self) -> str:
         parts = self.mac.split(":")
         if len(parts) >= 2:
-            suffix = f"{parts[-2]}:{parts[-1]}"
-        else:
-            suffix = self.mac[-5:]
+            return f"{parts[-2]}:{parts[-1]}"
+        return self.mac[-5:]
+
+    def _current_friendly_name(self) -> str:
+        base = self._base_name()
+        suffix = self._mac_suffix()
+        if base == self.mac:
+            return f"Client {suffix}"
         return f"{base} {suffix}"
+
+    def _device_registry_label(self) -> str:
+        base = self._base_name()
+        if base == self.mac:
+            return f"Client {self._mac_suffix()}"
+        return base
 
     @property
     def device_info(self) -> DeviceInfo:
         """Return device registry information for this tracked client."""
         return DeviceInfo(
             connections={(dr.CONNECTION_NETWORK_MAC, self.mac)},
-            name=self._base_name(),
+            name=self._device_registry_label(),
         )
 
     async def _async_update_device_registry_name(self) -> None:
-        desired_name = self._base_name()
+        desired_name = self._device_registry_label()
         device_registry = dr.async_get(self.hass)
         device = device_registry.async_get_device(connections={(dr.CONNECTION_NETWORK_MAC, self.mac)})
         if device and device.name != desired_name:
             device_registry.async_update_device(device.id, name=desired_name)
 
     def _handle_coordinator_update(self) -> None:
+        self._attr_name = self._current_friendly_name()
         super()._handle_coordinator_update()
         self.hass.async_create_task(self._async_update_device_registry_name())
 # -------------------------

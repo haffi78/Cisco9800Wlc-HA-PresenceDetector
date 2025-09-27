@@ -14,7 +14,14 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers import entity_registry as er, config_validation as cv, selector
-from .const import DOMAIN, CONF_IGNORE_SSL, CONF_DETAILED_MACS, CONF_SCAN_INTERVAL
+from .const import (
+    DOMAIN,
+    CONF_IGNORE_SSL,
+    CONF_DETAILED_MACS,
+    CONF_SCAN_INTERVAL,
+    CONF_AP_DETAIL_INTERVAL,
+    DEFAULT_AP_DETAIL_INTERVAL,
+)
 from .coordinator import DEFAULT_SCAN_INTERVAL, CiscoWLCUpdateCoordinator
 
 MAC_REGEX_COLON = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
@@ -329,10 +336,20 @@ class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
         current_enable_new = self._config_entry.options.get("enable_new_entities", False)
         stored_detailed: list[str] = self._config_entry.options.get(CONF_DETAILED_MACS, []) or []
         current_detailed = [mac for mac in (normalize_mac(m) for m in stored_detailed) if mac]
-        current_interval = int(self._config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL.total_seconds()))
+        current_interval = int(
+            self._config_entry.options.get(
+                CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL.total_seconds()
+            )
+        )
+        current_ap_interval = int(
+            self._config_entry.options.get(
+                CONF_AP_DETAIL_INTERVAL, DEFAULT_AP_DETAIL_INTERVAL
+            )
+        )
 
         coordinator = cast(
-            CiscoWLCUpdateCoordinator | None, self._config_entry.runtime_data
+            CiscoWLCUpdateCoordinator | None,
+            getattr(self._config_entry, "runtime_data", None),
         )
         mac_choices = _build_mac_options(self.hass, coordinator, current_detailed)
 
@@ -354,33 +371,41 @@ class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
             except (ValueError, TypeError):
                 interval_value = current_interval
 
+            try:
+                ap_interval_value = int(
+                    user_input.get(CONF_AP_DETAIL_INTERVAL, current_ap_interval)
+                )
+            except (ValueError, TypeError):
+                ap_interval_value = current_ap_interval
+
             new_options = {
-                "enable_new_entities": user_input.get("enable_new_entities", current_enable_new),
+                "enable_new_entities": user_input.get(
+                    "enable_new_entities", current_enable_new
+                ),
                 CONF_DETAILED_MACS: sorted(normalized_selected),
                 CONF_SCAN_INTERVAL: max(5, interval_value),
+                CONF_AP_DETAIL_INTERVAL: max(60, ap_interval_value),
             }
             return self.async_create_entry(title="", data=new_options)
 
+        fields: dict[Any, Any] = {
+            vol.Optional("enable_new_entities", default=current_enable_new): selector.BooleanSelector(),
+            vol.Optional(CONF_SCAN_INTERVAL, default=current_interval): vol.All(
+                vol.Coerce(int), vol.Range(min=5, max=3600)
+            ),
+            vol.Optional(CONF_AP_DETAIL_INTERVAL, default=current_ap_interval): vol.All(
+                vol.Coerce(int), vol.Range(min=60, max=86400)
+            ),
+        }
+
         if mac_choices:
-            schema = vol.Schema(
-                {
-                    vol.Optional("enable_new_entities", default=current_enable_new): selector.BooleanSelector(),
-                    vol.Optional(CONF_SCAN_INTERVAL, default=current_interval): vol.All(vol.Coerce(int), vol.Range(min=5, max=3600)),
-                    vol.Optional(CONF_DETAILED_MACS, default=current_detailed): cv.multi_select(mac_choices),
-                }
+            fields[vol.Optional(CONF_DETAILED_MACS, default=current_detailed)] = cv.multi_select(
+                mac_choices
             )
-        else:
-            schema = vol.Schema(
-                {
-                    vol.Optional("enable_new_entities", default=current_enable_new): selector.BooleanSelector(),
-                    vol.Optional(CONF_SCAN_INTERVAL, default=current_interval): vol.All(vol.Coerce(int), vol.Range(min=5, max=3600)),
-                }
-            )
+
+        schema = vol.Schema(fields)
 
         return self.async_show_form(
             step_id="init",
             data_schema=schema,
-            description_placeholders={
-                "enable_new_entities_label": "Disable new Entities"
-            },
         )

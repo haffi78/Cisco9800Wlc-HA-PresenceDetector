@@ -45,6 +45,30 @@
         "sensor": {
             "software_version": {
                 "name": "Software Version"
+            },
+            "ap_temperature": {
+                "name": "AP Temperature"
+            },
+            "ap_humidity": {
+                "name": "AP Humidity"
+            },
+            "ap_air_quality": {
+                "name": "AP Air Quality"
+            },
+            "ap_clients": {
+                "name": "AP Clients"
+            },
+            "ap_radio_channel": {
+                "name": "AP Radio Channel"
+            },
+            "ap_radio_channel_width": {
+                "name": "AP Radio Channel Width"
+            },
+            "ap_radio_tx_power": {
+                "name": "AP Radio Tx Power"
+            },
+            "ap_radio_clients": {
+                "name": "AP Radio Clients"
             }
         }
     }

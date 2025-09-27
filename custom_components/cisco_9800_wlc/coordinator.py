@@ -6,9 +6,16 @@ import asyncio
 import re
 from typing import Any
 from urllib.parse import quote
-from datetime import timedelta
-from datetime import datetime
-from .const import DOMAIN, CONF_IGNORE_SSL, SIGNAL_NEW_CLIENTS, CONF_DETAILED_MACS, CONF_SCAN_INTERVAL
+from datetime import datetime, timedelta, timezone
+from .const import (
+    DOMAIN,
+    CONF_IGNORE_SSL,
+    SIGNAL_NEW_CLIENTS,
+    CONF_DETAILED_MACS,
+    CONF_SCAN_INTERVAL,
+    CONF_AP_DETAIL_INTERVAL,
+    DEFAULT_AP_DETAIL_INTERVAL,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -27,6 +34,11 @@ DEBUG_PAYLOAD_MAX_CHARS = 10000  # truncate long payloads in debug logs
 ENRICH_RETRY_LIMIT = 3
 ENRICH_DELAY_SECONDS = 0.8
 INITIAL_ENRICH_DELAY_SECONDS = 4.0
+
+# Dispatcher signal name used to announce newly discovered clients (MACs)
+
+class CiscoWLCOperationError(Exception):
+    """Error raised when a WLC RPC operation fails."""
 
 # Dispatcher signal name used to announce newly discovered clients (MACs)
 
@@ -160,13 +172,7 @@ MAC_REGEX_CISCO = re.compile(r"^([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}$")  # 001a.2
 class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
     """Coordinator to manage Cisco 9800 WLC API polling."""
 
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        config: dict,
-        entry_id: str,
-        options: dict | None = None,
-    ):
+    def __init__(self, hass: HomeAssistant, config: dict, entry_id: str, options: dict | None = None):
         self.entry_id = entry_id
         self._options = options or {}
         polling_enabled = not self._options.get("disable_polling", False)
@@ -192,6 +198,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         self.entry_id = entry_id
 
         self.api_url = f"https://{self.host}/restconf/data"
+        self.operations_url = f"https://{self.host}/restconf/operations"
         self.data = {}
         self.session = async_get_clientsession(hass, verify_ssl=self.verify_ssl)
         self.api_semaphore = asyncio.Semaphore(5)  # Limit concurrent API requests to 5
@@ -204,6 +211,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         self._announced_loaded: bool = False
         self._store = Store(self.hass, 1, f"{DOMAIN}_announced_{self.entry_id}")
         self._client_store = Store(self.hass, 1, f"{DOMAIN}_clients_{self.entry_id}")
+        self._status_store = Store(self.hass, 1, f"{DOMAIN}_status_{self.entry_id}")
         self._client_cache_loaded = False
         self._cached_client_store: dict[str, dict[str, Any]] | None = None
         self._initial_enriched: set[str] = set()
@@ -217,7 +225,19 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         # One-time status summary after first successful full scan
         self._first_scan_info_logged = False
         self._last_enrich_status: dict[str, str] = {}
+        self._status_loaded = False
+        self._pending_status_save: asyncio.Task | None = None
         self._start_enrich_worker()
+
+        # Access point caching (metadata + environmental sensors)
+        self._ap_detail_interval = max(
+            60,
+            int(self._options.get(CONF_AP_DETAIL_INTERVAL, DEFAULT_AP_DETAIL_INTERVAL)),
+        )
+        self._ap_detail_next_fetch: datetime | None = None
+        self._ap_device_cache: dict[str, dict[str, Any]] = {}
+        self._ap_mac_aliases: dict[str, str] = {}
+        self._ap_name_map: dict[str, str] = {}
 
     def _set_wlc_status(
         self,
@@ -233,6 +253,10 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         push: when True, calls async_set_updated_data(self.data)
         """
         prev = self.data.get("wlc_status", {}) if isinstance(self.data, dict) else {}
+        if isinstance(software_version, str) and software_version.lower() == "n/a":
+            software_version = None
+        if isinstance(software_version_raw, str) and software_version_raw.lower() == "n/a":
+            software_version_raw = None
         version = software_version if software_version is not None else prev.get("software_version", "n/a")
         version_raw = (
             software_version_raw if software_version_raw is not None else prev.get("software_version_raw", "n/a")
@@ -251,6 +275,15 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         }
         if push:
             self.async_set_updated_data(self.data)
+        if self._status_store:
+            status_copy = dict(self.data["wlc_status"])
+            saved_version = status_copy.get("software_version")
+            if isinstance(saved_version, str) and saved_version.lower() != "n/a":
+                if self._pending_status_save and not self._pending_status_save.done():
+                    self._pending_status_save.cancel()
+                self._pending_status_save = self.hass.async_create_task(
+                    self._status_store.async_save(status_copy)
+                )
     def _polling_disabled(self):
         """Return True if polling is disabled in options."""
         return bool(self._options.get("disable_polling", False))
@@ -297,6 +330,21 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         finally:
             self._client_cache_loaded = True
 
+    async def async_load_cached_status(self) -> None:
+        """Load last-known controller status (software version, etc.)."""
+        if self._status_loaded:
+            return
+        try:
+            data = await self._status_store.async_load()
+            if isinstance(data, dict):
+                if not isinstance(self.data, dict):
+                    self.data = {}
+                self.data.setdefault("wlc_status", data)
+        except Exception as err:
+            _LOGGER.debug("Failed to load cached WLC status: %s", err)
+        finally:
+            self._status_loaded = True
+
     def _start_enrich_worker(self):
         if self._enrich_worker_task is None or self._enrich_worker_task.done():
             self._enrich_worker_task = self.hass.loop.create_task(
@@ -307,7 +355,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             self._enrich_worker_task.add_done_callback(lambda _: None)
 
     async def async_shutdown(self) -> None:
-        """Cancel the enrichment worker cleanly."""
+        """Cancel background work cleanly."""
         if self._enrich_worker_task and not self._enrich_worker_task.done():
             _LOGGER.debug("Cancelling enrichment worker")
             self._enrich_worker_task.cancel()
@@ -316,6 +364,14 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             except asyncio.CancelledError:
                 pass
         self._enrich_worker_task = None
+
+        if self._pending_status_save and not self._pending_status_save.done():
+            self._pending_status_save.cancel()
+            try:
+                await self._pending_status_save
+            except asyncio.CancelledError:
+                pass
+        self._pending_status_save = None
 
     async def _enrich_worker(self):
         """Background task to process queued one-shot enrichment requests."""
@@ -433,6 +489,57 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     _LOGGER.debug("GET %s -> %s TEXT: %s", url, status, trimmed)
                 return status, None, text
 
+    async def _post_operation(
+        self, endpoint: str, payload: dict[str, Any], *, timeout: int = 10
+    ) -> tuple[int, Any | None, str | None]:
+        """Execute a RESTCONF RPC operation on the controller."""
+
+        url = f"{self.operations_url}/{endpoint}"
+        headers = {
+            "Content-Type": "application/yang-data+json",
+            "Accept": "application/yang-data+json, application/json",
+        }
+
+        async def _request():
+            if _LOGGER.isEnabledFor(logging.DEBUG) and DEBUG_LOG_PAYLOADS:
+                try:
+                    payload_preview = json.dumps(payload, ensure_ascii=False)
+                    if len(payload_preview) > DEBUG_PAYLOAD_MAX_CHARS:
+                        payload_preview = payload_preview[:DEBUG_PAYLOAD_MAX_CHARS] + " …(truncated)"
+                    _LOGGER.debug("POST %s payload=%s", url, payload_preview)
+                except Exception:  # pragma: no cover - defensive
+                    _LOGGER.debug("POST %s payload=<unserializable>", url)
+
+            async with self.session.post(
+                url,
+                headers=headers,
+                auth=self.auth,
+                json=payload,
+                timeout=timeout,
+            ) as response:
+                text = await response.text()
+                data: Any | None = None
+                if response.content_type and "json" in response.content_type:
+                    try:
+                        data = await response.json(content_type=None)
+                    except Exception:  # pragma: no cover - defensive
+                        data = None
+
+                if response.status >= 400:
+                    trimmed = (
+                        text
+                        if len(text) <= DEBUG_PAYLOAD_MAX_CHARS
+                        else text[:DEBUG_PAYLOAD_MAX_CHARS] + " …(truncated)"
+                    )
+                    raise CiscoWLCOperationError(
+                        f"HTTP {response.status} calling {endpoint}: {trimmed or 'Unknown error'}"
+                    )
+
+                return response.status, data, text or None
+
+        async with self.api_semaphore:
+            return await _request()
+
 ############################################################################################################
 
     async def async_fetch_initial_status(self):
@@ -521,6 +628,17 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 "online_status": "Online",
             }
             updated.update(client_data)
+
+            try:
+                ap_sensors = await self._async_fetch_ap_environment()
+            except Exception as err:  # pragma: no cover - defensive
+                _LOGGER.debug("Failed to fetch AP environmental sensors during first run: %s", err)
+                ap_sensors = {}
+
+            if ap_sensors:
+                updated["ap_sensors"] = ap_sensors
+
+            await self._async_update_ap_devices(updated, ap_sensors)
 
             # Return the full updated data to the coordinator
             return updated
@@ -721,7 +839,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 {
                     mac: attrs
                     for mac, attrs in self.data.items()
-                    if mac != "wlc_status" and isinstance(attrs, dict)
+                    if mac not in {"wlc_status", "ap_sensors", "ap_devices"} and isinstance(attrs, dict)
                 }
                 if isinstance(self.data, dict)
                 else {}
@@ -766,6 +884,17 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             }
             updated.update(client_data)
 
+            try:
+                ap_sensors = await self._async_fetch_ap_environment()
+            except Exception as err:  # pragma: no cover - defensive
+                _LOGGER.debug("Failed to fetch AP environmental sensors: %s", err)
+                ap_sensors = {}
+
+            if ap_sensors:
+                updated.setdefault("ap_sensors", ap_sensors)
+
+            await self._async_update_ap_devices(updated, ap_sensors)
+
             # Persist last-known attributes (excluding controller status)
             try:
                 existing_cache = (
@@ -775,7 +904,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 )
                 merged_cache: dict[str, dict] = {}
                 for mac, attrs in updated.items():
-                    if mac == "wlc_status" or not isinstance(attrs, dict):
+                    if mac in {"wlc_status", "ap_sensors", "ap_devices"} or not isinstance(attrs, dict):
                         continue
                     prev_attrs = existing_cache.get(mac, {}) if isinstance(existing_cache, dict) else {}
                     merged = dict(prev_attrs)
@@ -909,9 +1038,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             return ":".join(flat[i:i+2] for i in range(0, 12, 2))
         return None
 
-    def _merge_client_attributes(
-        self, existing: dict[str, Any] | None, updates: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _merge_client_attributes(self, existing: dict[str, Any] | None, updates: dict[str, Any]) -> dict[str, Any]:
         """Merge new per-scan data with cached attributes without dropping useful values."""
         always_replace = {
             "connected",
@@ -928,6 +1055,591 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 merged[key] = value
         merged.pop("last_updated_time", None)
         return merged
+
+    def _canonical_ap_mac(self, mac: str | None) -> str | None:
+        """Resolve an AP MAC address to the canonical identifier used in caches."""
+
+        normalized = self._normalize_mac(mac)
+        if not normalized:
+            return None
+        return self._ap_mac_aliases.get(normalized, normalized)
+
+    async def _async_fetch_ap_environment(self) -> dict[str, dict[str, Any]]:
+        """Retrieve temperature, humidity, and air-quality readings for all APs."""
+
+        endpoints = {
+            "temperature": f"{self.api_url}/Cisco-IOS-XE-wireless-access-point-oper:access-point-oper-data/ap-temp",
+            "air_quality": f"{self.api_url}/Cisco-IOS-XE-wireless-access-point-oper:access-point-oper-data/ap-air-quality",
+        }
+
+        tasks = {key: self._get(url, timeout=8) for key, url in endpoints.items()}
+        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+        sensors: dict[str, dict[str, Any]] = {}
+
+        def _to_float(value: Any) -> float | None:
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        for (key, result) in zip(tasks.keys(), results):
+            if isinstance(result, Exception):
+                _LOGGER.debug("Failed to fetch %s sensor data: %s", key, result)
+                continue
+
+            status, data, text = result
+            if status != 200 or not isinstance(data, dict):
+                if text:
+                    _LOGGER.debug("HTTP %s while fetching %s sensors: %s", status, key, text)
+                continue
+
+            if key == "temperature":
+                list_key = "Cisco-IOS-XE-wireless-access-point-oper:ap-temp"
+            else:
+                list_key = "Cisco-IOS-XE-wireless-access-point-oper:ap-air-quality"
+
+            entries = data.get(list_key)
+            if not isinstance(entries, list):
+                continue
+
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                mac = self._canonical_ap_mac(entry.get("ap-mac"))
+                if not mac:
+                    continue
+
+                record = sensors.setdefault(mac, {"ap_mac": mac})
+
+                last_update = entry.get("last-update")
+                if key == "temperature":
+                    temp = _to_float(entry.get("temp"))
+                    humidity = _to_float(entry.get("humidity"))
+                    if temp is not None:
+                        record["temperature"] = temp
+                    if humidity is not None:
+                        record["humidity"] = humidity
+                    if last_update:
+                        record["temperature_last_update"] = last_update
+                else:
+                    iaq = _to_float(entry.get("iaq"))
+                    if iaq is not None:
+                        record["iaq"] = iaq
+                    tvoc = _to_float(entry.get("tvoc"))
+                    if tvoc is not None:
+                        record["tvoc"] = tvoc
+                    etoh = _to_float(entry.get("etoh"))
+                    if etoh is not None:
+                        record["etoh"] = etoh
+                    for index in range(13):
+                        key_name = f"rmox-{index}"
+                        rmox_value = _to_float(entry.get(key_name))
+                        if rmox_value is not None:
+                            record[key_name] = rmox_value
+                    if last_update:
+                        record["air_quality_last_update"] = last_update
+
+        if sensors:
+            _LOGGER.debug("Fetched environmental telemetry for %d AP(s)", len(sensors))
+
+        return sensors
+
+    def _resolve_ap_identifier(
+        self, *, ap_mac: str | None, ap_name: str | None
+    ) -> tuple[str | None, dict[str, str]]:
+        """Resolve the canonical AP MAC and payload identifier for RPC calls."""
+
+        identifier_payload: dict[str, str] = {}
+        canonical_mac: str | None = None
+
+        if ap_mac:
+            normalized = self._normalize_mac(ap_mac)
+            if not normalized:
+                raise CiscoWLCOperationError(f"Invalid AP MAC address: {ap_mac}")
+            identifier_payload["mac-addr"] = normalized
+            canonical_mac = self._canonical_ap_mac(normalized)
+            if not canonical_mac:
+                canonical_mac = normalized
+
+        if not identifier_payload and ap_name:
+            name = ap_name.strip()
+            if not name:
+                raise CiscoWLCOperationError("AP name cannot be empty")
+            identifier_payload["ap-name"] = name
+            canonical_mac = self._ap_name_map.get(name)
+            if canonical_mac is None:
+                for mac, record in self._ap_device_cache.items():
+                    if isinstance(record, dict) and record.get("name") == name:
+                        canonical_mac = mac
+                        break
+
+        if not identifier_payload:
+            raise CiscoWLCOperationError("Either ap_mac or ap_name must be provided")
+
+        return canonical_mac, identifier_payload
+
+    async def async_set_ap_led_state(
+        self, *, ap_mac: str | None, ap_name: str | None, enabled: bool
+    ) -> None:
+        """Enable or disable the AP LED."""
+
+        canonical_mac, identifier_payload = self._resolve_ap_identifier(
+            ap_mac=ap_mac, ap_name=ap_name
+        )
+
+        body = {
+            "Cisco-IOS-XE-wireless-access-point-cfg-rpc:input": {
+                "ledstate": bool(enabled),
+                **identifier_payload,
+            }
+        }
+
+        await self._post_operation(
+            "Cisco-IOS-XE-wireless-access-point-cfg-rpc:set-lrad-led-state",
+            body,
+            timeout=15,
+        )
+
+        if canonical_mac:
+            record = self._ap_device_cache.setdefault(canonical_mac, {"ap_mac": canonical_mac})
+            record["led_enabled"] = bool(enabled)
+
+        await self.async_request_refresh()
+
+    async def async_set_ap_led_flash(
+        self,
+        *,
+        ap_mac: str | None,
+        ap_name: str | None,
+        enabled: bool,
+        duration: int | None = None,
+    ) -> None:
+        """Configure AP LED flashing state and optional duration."""
+
+        canonical_mac, identifier_payload = self._resolve_ap_identifier(
+            ap_mac=ap_mac, ap_name=ap_name
+        )
+
+        base_endpoint = "Cisco-IOS-XE-wireless-access-point-cfg-rpc:set-lrad-led-flash"
+
+        if duration is not None:
+            if duration < 0 or duration > 3600:
+                raise CiscoWLCOperationError("Flash duration must be between 0 and 3600 seconds")
+            duration_body = {
+                "Cisco-IOS-XE-wireless-access-point-cfg-rpc:input": {
+                    "config-type": "set-led-flash-duration",
+                    "flash-sec": int(duration),
+                    **identifier_payload,
+                }
+            }
+            await self._post_operation(base_endpoint, duration_body, timeout=15)
+
+        state_body = {
+            "Cisco-IOS-XE-wireless-access-point-cfg-rpc:input": {
+                "config-type": "set-led-flash-state",
+                "led-flash-state": bool(enabled),
+                **identifier_payload,
+            }
+        }
+
+        await self._post_operation(base_endpoint, state_body, timeout=15)
+
+        if canonical_mac:
+            record = self._ap_device_cache.setdefault(canonical_mac, {"ap_mac": canonical_mac})
+            record["led_flashing"] = bool(enabled)
+            if duration is not None:
+                record["led_flash_duration"] = int(duration)
+
+        await self.async_request_refresh()
+
+    async def _async_fetch_ap_metadata(self) -> dict[str, dict[str, Any]]:
+        """Fetch AP join status, CAPWAP details, and radio information."""
+
+        join_url = (
+            f"{self.api_url}/Cisco-IOS-XE-wireless-ap-global-oper:ap-global-oper-data/ap-join-stats"
+        )
+        oper_url = (
+            f"{self.api_url}/Cisco-IOS-XE-wireless-access-point-oper:access-point-oper-data"
+        )
+
+        join_future = self._get(join_url, timeout=10)
+        oper_future = self._get(oper_url, timeout=20)
+        join_result, oper_result = await asyncio.gather(join_future, oper_future, return_exceptions=True)
+
+        join_entries: list[dict[str, Any]] = []
+        if isinstance(join_result, Exception):
+            _LOGGER.debug("Failed to fetch AP join stats: %s", join_result)
+        else:
+            status, data, text = join_result
+            if status == 200 and isinstance(data, dict):
+                join_entries = data.get(
+                    "Cisco-IOS-XE-wireless-ap-global-oper:ap-join-stats",
+                    [],
+                )
+            elif text:
+                _LOGGER.debug("HTTP %s fetching AP join stats: %s", status, text)
+
+        oper_root: dict[str, Any] = {}
+        if isinstance(oper_result, Exception):
+            _LOGGER.debug("Failed to fetch AP operational data: %s", oper_result)
+        else:
+            status, data, text = oper_result
+            if status == 200 and isinstance(data, dict):
+                oper_root = data.get(
+                    "Cisco-IOS-XE-wireless-access-point-oper:access-point-oper-data",
+                    {},
+                )
+            elif text:
+                _LOGGER.debug("HTTP %s fetching AP operational data: %s", status, text)
+
+        alias_map: dict[str, str] = {}
+        name_to_ap: dict[str, str] = {}
+        seen_now: set[str] = set()
+        seen_timestamp = datetime.now(timezone.utc).isoformat()
+
+        def _record_alias(primary: str | None, *aliases: str | None) -> None:
+            primary_norm = self._normalize_mac(primary)
+            if not primary_norm:
+                return
+            alias_map.setdefault(primary_norm, primary_norm)
+            for alias in aliases:
+                alias_norm = self._normalize_mac(alias)
+                if alias_norm:
+                    alias_map.setdefault(alias_norm, primary_norm)
+
+        for entry in oper_root.get("ethernet-mac-wtp-mac-map", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            _record_alias(entry.get("wtp-mac"), entry.get("ethernet-mac"))
+
+        for entry in oper_root.get("ap-name-mac-map", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("wtp-name")
+            canonical = self._normalize_mac(entry.get("wtp-mac")) or self._normalize_mac(entry.get("eth-mac"))
+            if not canonical:
+                continue
+            _record_alias(canonical, entry.get("wtp-mac"), entry.get("eth-mac"))
+            if isinstance(name, str) and name.strip():
+                name_to_ap.setdefault(name.strip(), canonical)
+
+        devices: dict[str, dict[str, Any]] = {}
+
+        def _canonical(mac: str | None) -> str | None:
+            normalized = self._normalize_mac(mac)
+            if not normalized:
+                return None
+            return alias_map.get(normalized, normalized)
+
+        for entry in join_entries:
+            if not isinstance(entry, dict):
+                continue
+            join_info = entry.get("ap-join-info", {})
+            wtp = entry.get("wtp-mac") or join_info.get("ap-ethernet-mac")
+            ap_mac = _canonical(wtp)
+            if not ap_mac:
+                ap_mac = self._normalize_mac(wtp)
+            if not ap_mac:
+                continue
+            record = devices.setdefault(ap_mac, {"ap_mac": ap_mac})
+            alias_map.setdefault(ap_mac, ap_mac)
+            wtp_mac = self._normalize_mac(entry.get("wtp-mac"))
+            if wtp_mac:
+                record["wtp_mac"] = wtp_mac
+                alias_map.setdefault(wtp_mac, ap_mac)
+            eth_mac = self._normalize_mac(join_info.get("ap-ethernet-mac"))
+            if eth_mac:
+                alias_map.setdefault(eth_mac, ap_mac)
+            name = join_info.get("ap-name")
+            if isinstance(name, str) and name.strip():
+                record["name"] = name.strip()
+                name_to_ap.setdefault(name.strip(), ap_mac)
+            ip_addr = join_info.get("ap-ip-addr")
+            if ip_addr:
+                record["ip_address"] = ip_addr
+            record["is_joined"] = bool(join_info.get("is-joined"))
+            record["last_join_time"] = join_info.get("last-succ-join-atmpt-time")
+            record["last_error"] = join_info.get("last-error-type")
+            if join_info:
+                record["join_info"] = join_info
+
+        for entry in oper_root.get("capwap-data", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            wtp = entry.get("wtp-mac") or entry.get("wtp-ip")
+            ap_mac = _canonical(wtp)
+            if not ap_mac:
+                name = entry.get("name")
+                if isinstance(name, str) and name.strip():
+                    ap_mac = name_to_ap.get(name.strip())
+            if not ap_mac:
+                ap_mac = self._normalize_mac(wtp)
+            if not ap_mac:
+                continue
+            record = devices.setdefault(ap_mac, {"ap_mac": ap_mac})
+            alias_map.setdefault(ap_mac, ap_mac)
+            if wtp:
+                norm_wtp = self._normalize_mac(wtp)
+                if norm_wtp:
+                    record.setdefault("wtp_mac", norm_wtp)
+                    alias_map.setdefault(norm_wtp, ap_mac)
+            seen_now.add(ap_mac)
+            name = entry.get("name")
+            if isinstance(name, str) and name.strip():
+                record["name"] = name.strip()
+                name_to_ap.setdefault(name.strip(), ap_mac)
+            ip_addr = entry.get("ip-addr") or entry.get("wtp-ip")
+            if ip_addr:
+                record["ip_address"] = ip_addr
+            location = entry.get("ap-location", {}).get("location")
+            if location:
+                record["location"] = location
+            state = entry.get("ap-state", {})
+            if isinstance(state, dict):
+                record["admin_state"] = state.get("ap-admin-state")
+                record["oper_state"] = state.get("ap-operation-state")
+                oper_state = str(state.get("ap-operation-state") or "").lower()
+                record["online"] = oper_state in {"registered", "oper-up", "up"}
+            else:
+                record["online"] = True
+            mode_data = entry.get("ap-mode-data", {})
+            if isinstance(mode_data, dict):
+                record["mode"] = mode_data.get("wtp-mode")
+            static_info = entry.get("device-detail", {}).get("static-info", {})
+            if isinstance(static_info, dict):
+                model = static_info.get("ap-models", {}).get("model")
+                if model:
+                    record["model"] = model
+            dynamic_info = entry.get("device-detail", {}).get("dynamic-info", {})
+            if isinstance(dynamic_info, dict):
+                record["led_enabled"] = bool(dynamic_info.get("led-state-enabled"))
+                record["led_flashing"] = bool(dynamic_info.get("led-flash-enabled"))
+                temp_info = dynamic_info.get("temp-info")
+                if isinstance(temp_info, dict) and temp_info.get("degree"):
+                    env = record.setdefault("environment", {})
+                    env.setdefault("internal_temperature", temp_info.get("degree"))
+
+        for entry in oper_root.get("radio-oper-data", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            ap_mac = _canonical(entry.get("wtp-mac"))
+            if not ap_mac:
+                continue
+            record = devices.setdefault(ap_mac, {"ap_mac": ap_mac})
+            seen_now.add(ap_mac)
+            slot = entry.get("slot-id", entry.get("radio-slot-id"))
+            if slot is None:
+                continue
+            try:
+                slot_index = int(slot)
+            except (TypeError, ValueError):
+                continue
+            radio_info = record.setdefault("radios", {}).setdefault(slot_index, {})
+            radio_info["radio_type"] = entry.get("radio-type")
+            radio_info["admin_state"] = entry.get("admin-state")
+            radio_info["oper_state"] = entry.get("oper-state")
+            radio_info["band"] = entry.get("current-active-band")
+            ht_cfg = entry.get("phy-ht-cfg", {}).get("cfg-data", {})
+            if isinstance(ht_cfg, dict):
+                radio_info["channel"] = ht_cfg.get("curr-freq")
+                radio_info["channel_width_mhz"] = ht_cfg.get("chan-width")
+            band_list = entry.get("radio-band-info", []) or []
+            band_info = None
+            current_band_id = entry.get("current-band-id")
+            for candidate in band_list:
+                if candidate.get("band-id") == current_band_id:
+                    band_info = candidate
+                    break
+            if band_info is None and band_list:
+                band_info = band_list[0]
+            if isinstance(band_info, dict):
+                radio_info["channel_width_cap"] = band_info.get("dot11ac-channel-width-cap")
+                tx_cfg = band_info.get("phy-tx-pwr-lvl-cfg", {}).get("cfg-data", {})
+                if isinstance(tx_cfg, dict):
+                    radio_info["tx_power_dbm"] = tx_cfg.get("curr-tx-power-in-dbm")
+
+        for entry in oper_root.get("radio-oper-stats", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            ap_mac = _canonical(entry.get("ap-mac"))
+            if not ap_mac:
+                continue
+            slot = entry.get("slot-id")
+            try:
+                slot_index = int(slot)
+            except (TypeError, ValueError):
+                continue
+            client_count = entry.get("aid-user-list")
+            try:
+                client_count = int(client_count)
+            except (TypeError, ValueError):
+                client_count = 0
+            record = devices.setdefault(ap_mac, {"ap_mac": ap_mac})
+            radio_info = record.setdefault("radios", {}).setdefault(slot_index, {})
+            radio_info["client_count"] = client_count
+            seen_now.add(ap_mac)
+
+        for entry in oper_root.get("ap-sensor-status", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            ap_mac = _canonical(entry.get("ap-mac"))
+            sensor_type = entry.get("sensor-type")
+            if not ap_mac or not sensor_type:
+                continue
+            record = devices.setdefault(ap_mac, {"ap_mac": ap_mac})
+            sensors = record.setdefault("sensor_status", {})
+            sensors[sensor_type] = {
+                "config_state": entry.get("config-state"),
+                "admin_state": entry.get("admin-state"),
+                "oper_state": entry.get("oper-state"),
+                "interval": entry.get("interval"),
+            }
+            seen_now.add(ap_mac)
+
+        for entry in oper_root.get("cdp-cache-data", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            ap_mac = _canonical(entry.get("mac-addr") or entry.get("wtp-mac-addr"))
+            if not ap_mac:
+                continue
+            record = devices.setdefault(ap_mac, {"ap_mac": ap_mac})
+            cdp_info: dict[str, Any] = {}
+
+            def _set(src: str, dest: str) -> None:
+                value = entry.get(src)
+                if value is None:
+                    return
+                if isinstance(value, str) and not value.strip():
+                    return
+                cdp_info[dest] = value
+
+            _set("cdp-cache-device-id", "device_id")
+            _set("last-updated-time", "last_update")
+            _set("cdp-cache-device-port", "neighbor_port")
+            _set("cdp-cache-platform", "platform")
+            _set("cdp-cache-ip-address-value", "neighbor_ip")
+
+            if cdp_info:
+                record["cdp"] = cdp_info
+                seen_now.add(ap_mac)
+
+        for entry in oper_root.get("lldp-neigh", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            ap_mac = _canonical(entry.get("wtp-mac"))
+            if not ap_mac:
+                continue
+            record = devices.setdefault(ap_mac, {"ap_mac": ap_mac})
+            lldp_info: dict[str, Any] = {}
+
+            def _set_lldp(src: str, dest: str) -> None:
+                value = entry.get(src)
+                if value is None:
+                    return
+                if isinstance(value, str) and not value.strip():
+                    return
+                lldp_info[dest] = value
+
+            _set_lldp("neigh-mac", "neighbor_mac")
+            _set_lldp("port-id", "port_id")
+            _set_lldp("system-name", "system_name")
+            _set_lldp("mgmt-addr", "management_address")
+
+            if lldp_info:
+                record["lldp"] = lldp_info
+                seen_now.add(ap_mac)
+
+        for ap_mac, record in devices.items():
+            radios = record.get("radios", {})
+            if not isinstance(radios, dict):
+                continue
+            totals = {
+                "client_count": 0,
+                "clients_24ghz": 0,
+                "clients_5ghz": 0,
+                "clients_6ghz": 0,
+            }
+            for slot_info in radios.values():
+                if not isinstance(slot_info, dict):
+                    continue
+                try:
+                    count = int(slot_info.get("client_count", 0) or 0)
+                except (TypeError, ValueError):
+                    count = 0
+                totals["client_count"] += count
+                band = str(slot_info.get("band") or "").lower()
+                if "6" in band and "ghz" in band:
+                    totals["clients_6ghz"] += count
+                elif "5" in band and "ghz" in band:
+                    totals["clients_5ghz"] += count
+                elif "2" in band and "4" in band:
+                    totals["clients_24ghz"] += count
+            record.update(totals)
+            if ap_mac in seen_now:
+                record["last_seen"] = seen_timestamp
+
+        if devices:
+            friendly = [record.get("name") or ap_mac for ap_mac, record in devices.items()]
+            _LOGGER.debug(
+                "Collected metadata for %d AP(s): %s",
+                len(devices),
+                ", ".join(sorted(friendly)),
+            )
+
+        self._ap_mac_aliases = alias_map
+        self._ap_name_map = name_to_ap
+        return devices
+
+    async def _async_update_ap_devices(
+        self, target: dict[str, Any], ap_sensors: dict[str, dict[str, Any]]
+    ) -> None:
+        """Refresh cached AP metadata and merge environmental data."""
+
+        now = datetime.now()
+        should_fetch = False
+        if self._ap_detail_interval > 0:
+            if (
+                self._ap_detail_next_fetch is None
+                or now >= self._ap_detail_next_fetch
+                or not self._ap_device_cache
+            ):
+                should_fetch = True
+
+        if should_fetch:
+            try:
+                devices = await self._async_fetch_ap_metadata()
+                if devices:
+                    self._ap_device_cache = devices
+            except Exception as err:  # pragma: no cover - defensive
+                _LOGGER.debug("Failed to fetch AP metadata: %s", err)
+            self._ap_detail_next_fetch = now + timedelta(seconds=self._ap_detail_interval)
+
+        if isinstance(ap_sensors, dict):
+            for ap_mac, env in ap_sensors.items():
+                if not isinstance(env, dict):
+                    continue
+                canonical_mac = self._canonical_ap_mac(ap_mac)
+                if not canonical_mac:
+                    continue
+                record = self._ap_device_cache.setdefault(canonical_mac, {"ap_mac": canonical_mac})
+                env_record = record.setdefault("environment", {})
+                env_record.update(env)
+                for key, value in env.items():
+                    record[key] = value
+
+        if self._ap_device_cache:
+            target["ap_devices"] = self._ap_device_cache
+
+        if should_fetch and self._ap_device_cache:
+            names = [record.get("name") or ap_mac for ap_mac, record in self._ap_device_cache.items()]
+            _LOGGER.info(
+                "AP metadata cache now holds %d AP(s): %s",
+                len(self._ap_device_cache),
+                ", ".join(sorted(names)),
+            )
 
     async def _async_update_client_snapshot(self, mac: str) -> None:
         """Persist the latest attributes for a single MAC to the cache."""

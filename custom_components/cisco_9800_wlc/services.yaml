@@ -1,0 +1,47 @@
+set_ap_led_state:
+  name: Set AP LED State
+  description: Enable or disable the indicator LED on a specific access point.
+  fields:
+    entry_id:
+      name: Config Entry ID
+      description: Optional config entry ID when multiple controllers are configured.
+      example: 01K65GQ3TX1QSE74YTEDHMYB52
+    ap_mac:
+      name: AP MAC Address
+      description: MAC address of the access point (format 00:11:22:33:44:55).
+      example: "34:5d:a8:0a:2e:40"
+    ap_name:
+      name: AP Name
+      description: Name of the AP as shown on the controller (used if ap_mac not supplied).
+      example: HHO-1haed-9166
+    enabled:
+      name: Enabled
+      description: Turn the LED on (`true`) or off (`false`).
+      required: true
+      example: true
+
+set_ap_led_flash:
+  name: Set AP LED Flash
+  description: Start or stop flashing the indicator LED on a specific access point.
+  fields:
+    entry_id:
+      name: Config Entry ID
+      description: Optional config entry ID when multiple controllers are configured.
+      example: 01K65GQ3TX1QSE74YTEDHMYB52
+    ap_mac:
+      name: AP MAC Address
+      description: MAC address of the access point (format 00:11:22:33:44:55).
+      example: "34:5d:a8:0a:2e:40"
+    ap_name:
+      name: AP Name
+      description: Name of the AP as shown on the controller (used if ap_mac not supplied).
+      example: HHO-1haed-9166
+    enabled:
+      name: Enabled
+      description: Flash the LED (`true`) or stop flashing (`false`).
+      required: true
+      example: true
+    duration:
+      name: Flash Duration
+      description: Optional duration in seconds (0-3600). Only applied when flashing is enabled.
+      example: 60

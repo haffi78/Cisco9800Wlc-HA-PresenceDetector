@@ -22,27 +22,30 @@
                     "unknown": "An unexpected error occurred. Please try again."
                 }
             }
-        },
-        "options": {
-            "step": {
-                "init": {
-                    "title": "Cisco 9800 WLC Options",
-                    "data": {
-                        "enable_new_entities": "Disable newly discovered devices by default"
-                    }
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Cisco 9800 WLC Options",
+                "data": {
+                    "enable_new_entities": "Disable newly discovered devices by default",
+                    "scan_interval": "Polling interval (seconds)",
+                    "ap_detail_interval": "AP metadata refresh interval (seconds)",
+                    "detailed_macs": "Clients to poll for detailed telemetry"
                 }
             }
+        }
+    },
+    "entity": {
+        "binary_sensor": {
+            "controller_status": {
+                "name": "Cisco 9800 WLC Status"
+            }
         },
-        "entity": {
-            "binary_sensor": {
-                "controller_status": {
-                    "name": "Cisco 9800 WLC Status"
-                }
-            },
-            "sensor": {
-                "software_version": {
-                    "name": "Cisco 9800 WLC Software Version"
-                }
+        "sensor": {
+            "software_version": {
+                "name": "Cisco 9800 WLC Software Version"
             }
         }
     }

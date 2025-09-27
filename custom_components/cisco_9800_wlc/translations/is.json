@@ -22,63 +22,63 @@
                     "unknown": "Óvænt villa kom upp. Reyndu aftur."
                 }
             }
-        },
-        "options": {
-            "step": {
-                "init": {
-                    "title": "Stillingar fyrir Cisco 9800 WLC",
-                    "data": {
-                        "enable_new_entities": "Gera nýjar uppgötvaðar græjur óvirkar sjálfgefið",
-                        "scan_interval": "Skönnunarbil (sek.)",
-                        "ap_detail_interval": "Ítarlegt skönnunarbil AP (sek.)",
-                        "detailed_macs": "Veldu MAC-tölur fyrir ítarlega skoðun"
-                    }
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Stillingar fyrir Cisco 9800 WLC",
+                "data": {
+                    "enable_new_entities": "Gera nýjar uppgötvaðar græjur óvirkar sjálfgefið",
+                    "scan_interval": "Tíðni reglulegra kannana (sek.)",
+                    "ap_detail_interval": "Uppfærslutíðni AP-lýsinga (sek.)",
+                    "detailed_macs": "Veldu viðskiptavini fyrir ítarlega gagnaöflun"
                 }
             }
+        }
+    },
+    "entity": {
+        "binary_sensor": {
+            "controller_status": {
+                "name": "Staða Cisco 9800 WLC"
+            }
         },
-        "entity": {
-            "binary_sensor": {
-                "controller_status": {
-                    "name": "Staða Cisco 9800 WLC"
-                }
+        "sensor": {
+            "software_version": {
+                "name": "Hugbúnaðarútgáfa Cisco 9800 WLC"
             },
-            "sensor": {
-                "software_version": {
-                    "name": "Hugbúnaðarútgáfa Cisco 9800 WLC"
-                },
-                "ap_temperature": {
-                    "name": "Hitastig"
-                },
-                "ap_humidity": {
-                    "name": "Rakastig"
-                },
-                "ap_air_quality": {
-                    "name": "Loftgæðastuðull"
-                },
-                "ap_clients": {
-                    "name": "Heildarfjöldi tengdra viðskiptavina"
-                },
-                "ap_clients_24ghz": {
-                    "name": "Viðskiptavinir (2,4 GHz)"
-                },
-                "ap_clients_5ghz": {
-                    "name": "Viðskiptavinir (5 GHz)"
-                },
-                "ap_clients_6ghz": {
-                    "name": "Viðskiptavinir (6 GHz)"
-                },
-                "ap_status": {
-                    "name": "Staða AP"
-                },
-                "ap_radio_channel": {
-                    "name": "Rás nets"
-                },
-                "ap_radio_channel_width": {
-                    "name": "Rásarbreidd"
-                },
-                "ap_radio_tx_power": {
-                    "name": "Sendistyrkur"
-                }
+            "ap_temperature": {
+                "name": "Hitastig"
+            },
+            "ap_humidity": {
+                "name": "Rakastig"
+            },
+            "ap_air_quality": {
+                "name": "Loftgæðastuðull"
+            },
+            "ap_clients": {
+                "name": "Heildarfjöldi tengdra viðskiptavina"
+            },
+            "ap_clients_24ghz": {
+                "name": "Viðskiptavinir (2,4 GHz)"
+            },
+            "ap_clients_5ghz": {
+                "name": "Viðskiptavinir (5 GHz)"
+            },
+            "ap_clients_6ghz": {
+                "name": "Viðskiptavinir (6 GHz)"
+            },
+            "ap_status": {
+                "name": "Staða AP"
+            },
+            "ap_radio_channel": {
+                "name": "Rás nets"
+            },
+            "ap_radio_channel_width": {
+                "name": "Rásarbreidd"
+            },
+            "ap_radio_tx_power": {
+                "name": "Sendistyrkur"
             }
         }
     }

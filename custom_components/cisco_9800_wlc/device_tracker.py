@@ -255,9 +255,15 @@ async def async_setup_entry(
     # Fetch initial list of clients from WLC
     _LOGGER.debug("Fetching initial client list from WLC")
     await coordinator.async_request_refresh()
-    all_active_clients: set[str] = {
-        k for k in coordinator.data.keys() if k != "wlc_status"
-    }
+    all_active_clients: set[str] = set()
+    for key in coordinator.data.keys():
+        if not isinstance(key, str):
+            continue
+        if key == "wlc_status":
+            continue
+        if coordinator._normalize_mac(key) is None:
+            continue
+        all_active_clients.add(key)
 
     #  **Step 1: Retrieve all known devices from Home Assistant**
     entity_registry = er.async_get(hass)
@@ -277,10 +283,12 @@ async def async_setup_entry(
                 )
 
             uid = entity_entry.unique_id.lower()
-            known_clients.add(uid)
             normalized_uid = coordinator._normalize_mac(uid)
-            if normalized_uid:
-                known_clients.add(normalized_uid)
+            if not normalized_uid:
+                _LOGGER.debug("Skipping invalid MAC unique_id %s", uid)
+                continue
+            known_clients.add(uid)
+            known_clients.add(normalized_uid)
 
     _LOGGER.info(
         "Initial registration: %d active from WLC, %d total to register",
@@ -294,6 +302,8 @@ async def async_setup_entry(
     # **Step 3: Register All Clients in Home Assistant**
     clients_to_add: list[CiscoWLCClient] = []
     for mac in all_clients:
+        if coordinator._normalize_mac(mac) is None:
+            continue
         if mac not in tracked_macs:
             clients_to_add.append(CiscoWLCClient(coordinator, mac, coordinator.data.get(mac, {}), enable_new_entities))
             tracked_macs.add(mac)
@@ -315,6 +325,8 @@ async def async_setup_entry(
             return
         new_entities: list[CiscoWLCClient] = []
         for mac in new_macs:
+            if coordinator._normalize_mac(mac) is None:
+                continue
             if mac in tracked_macs:
                 continue
             new_entities.append(

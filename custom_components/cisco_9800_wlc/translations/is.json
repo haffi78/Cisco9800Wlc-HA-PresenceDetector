@@ -1,0 +1,85 @@
+{
+    "title": "Cisco 9800 WLC",
+    "config": {
+        "abort": {
+            "already_configured": "Þessi Cisco 9800 WLC er þegar sett upp."
+        },
+        "step": {
+            "user": {
+                "title": "Setja upp Cisco 9800 WLC",
+                "description": "{setup_hint}\n\n{connection_hint}\n\n{new_entities_hint}",
+                "data": {
+                    "host": "IP-tala WLC",
+                    "username": "Notandanafn",
+                    "password": "Lykilorð",
+                    "ignore_ssl": "Hunsa sjálf-undirritað SSL-vottorð",
+                    "enable_new_entities": "Gera nýjar uppgötvaðar græjur óvirkar sjálfgefið"
+                },
+                "errors": {
+                    "cannot_connect": "Gat ekki tengst Cisco 9800 WLC. Athugaðu IP-tölu og aðgangsupplýsingar.",
+                    "invalid_auth": "Ógilt notandanafn eða lykilorð.",
+                    "ssl_error": "SSL staðfesting mistókst. Prófaðu að virkja 'Hunsa sjálf-undirritað SSL'.",
+                    "unknown": "Óvænt villa kom upp. Reyndu aftur."
+                }
+            }
+        },
+        "options": {
+            "step": {
+                "init": {
+                    "title": "Stillingar fyrir Cisco 9800 WLC",
+                    "data": {
+                        "enable_new_entities": "Gera nýjar uppgötvaðar græjur óvirkar sjálfgefið",
+                        "scan_interval": "Skönnunarbil (sek.)",
+                        "ap_detail_interval": "Ítarlegt skönnunarbil AP (sek.)",
+                        "detailed_macs": "Veldu MAC-tölur fyrir ítarlega skoðun"
+                    }
+                }
+            }
+        },
+        "entity": {
+            "binary_sensor": {
+                "controller_status": {
+                    "name": "Staða Cisco 9800 WLC"
+                }
+            },
+            "sensor": {
+                "software_version": {
+                    "name": "Hugbúnaðarútgáfa Cisco 9800 WLC"
+                },
+                "ap_temperature": {
+                    "name": "Hitastig"
+                },
+                "ap_humidity": {
+                    "name": "Rakastig"
+                },
+                "ap_air_quality": {
+                    "name": "Loftgæðastuðull"
+                },
+                "ap_clients": {
+                    "name": "Heildarfjöldi tengdra viðskiptavina"
+                },
+                "ap_clients_24ghz": {
+                    "name": "Viðskiptavinir (2,4 GHz)"
+                },
+                "ap_clients_5ghz": {
+                    "name": "Viðskiptavinir (5 GHz)"
+                },
+                "ap_clients_6ghz": {
+                    "name": "Viðskiptavinir (6 GHz)"
+                },
+                "ap_status": {
+                    "name": "Staða AP"
+                },
+                "ap_radio_channel": {
+                    "name": "Rás nets"
+                },
+                "ap_radio_channel_width": {
+                    "name": "Rásarbreidd"
+                },
+                "ap_radio_tx_power": {
+                    "name": "Sendistyrkur"
+                }
+            }
+        }
+    }
+}

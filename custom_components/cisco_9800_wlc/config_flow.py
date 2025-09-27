@@ -14,6 +14,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers import entity_registry as er, config_validation as cv, selector
+from homeassistant.helpers.translation import async_get_translations
 from .const import (
     DOMAIN,
     CONF_IGNORE_SSL,
@@ -328,6 +329,41 @@ class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
 
     def __init__(self, config_entry: ConfigEntry) -> None:
         self._config_entry = config_entry
+        self._option_labels: dict[str, str] | None = None
+
+    async def _async_get_option_labels(self) -> dict[str, str]:
+        """Return localized labels for options form fields."""
+
+        if self._option_labels is not None:
+            return self._option_labels
+
+        defaults = {
+            "enable_new_entities": "Disable newly discovered devices by default",
+            "scan_interval": "Polling interval (seconds)",
+            "ap_detail_interval": "AP metadata refresh interval (seconds)",
+            "detailed_macs": "Clients to poll for detailed telemetry",
+        }
+
+        try:
+            translations = await async_get_translations(
+                self.hass,
+                self.hass.config.language,
+                "options",
+                {DOMAIN},
+            )
+        except Exception:  # pragma: no cover - defensive
+            translations = {}
+
+        labels: dict[str, str] = {}
+        for key, fallback in defaults.items():
+            translation_key = f"component.{DOMAIN}.options.step.init.data.{key}"
+            label = translations.get(translation_key, fallback)
+            if not isinstance(label, str) or not label.strip():
+                label = fallback
+            labels[key] = label
+
+        self._option_labels = labels
+        return labels
 
     async def async_step_init(
         self, user_input: Mapping[str, Any] | None = None
@@ -353,8 +389,22 @@ class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
         )
         mac_choices = _build_mac_options(self.hass, coordinator, current_detailed)
 
+        labels = await self._async_get_option_labels()
+        label_enable_new = labels["enable_new_entities"]
+        label_scan_interval = labels["scan_interval"]
+        label_ap_detail = labels["ap_detail_interval"]
+        label_detailed_macs = labels["detailed_macs"]
+
         if user_input is not None:
-            detailed_selected = user_input.get(CONF_DETAILED_MACS, [])
+            def _input_value(raw_key: str, label: str, default: Any) -> Any:
+                if isinstance(user_input, Mapping):
+                    if label in user_input:
+                        return user_input[label]
+                    if raw_key in user_input:
+                        return user_input[raw_key]
+                return default
+
+            detailed_selected = _input_value(CONF_DETAILED_MACS, label_detailed_macs, [])
             if isinstance(detailed_selected, dict):
                 detailed_selected = [key for key, selected in detailed_selected.items() if selected]
             elif not isinstance(detailed_selected, list):
@@ -367,20 +417,20 @@ class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
             }
 
             try:
-                interval_value = int(user_input.get(CONF_SCAN_INTERVAL, current_interval))
+                interval_value = int(_input_value(CONF_SCAN_INTERVAL, label_scan_interval, current_interval))
             except (ValueError, TypeError):
                 interval_value = current_interval
 
             try:
                 ap_interval_value = int(
-                    user_input.get(CONF_AP_DETAIL_INTERVAL, current_ap_interval)
+                    _input_value(CONF_AP_DETAIL_INTERVAL, label_ap_detail, current_ap_interval)
                 )
             except (ValueError, TypeError):
                 ap_interval_value = current_ap_interval
 
             new_options = {
-                "enable_new_entities": user_input.get(
-                    "enable_new_entities", current_enable_new
+                "enable_new_entities": bool(
+                    _input_value("enable_new_entities", label_enable_new, current_enable_new)
                 ),
                 CONF_DETAILED_MACS: sorted(normalized_selected),
                 CONF_SCAN_INTERVAL: max(5, interval_value),
@@ -389,17 +439,17 @@ class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
             return self.async_create_entry(title="", data=new_options)
 
         fields: dict[Any, Any] = {
-            vol.Optional("enable_new_entities", default=current_enable_new): selector.BooleanSelector(),
-            vol.Optional(CONF_SCAN_INTERVAL, default=current_interval): vol.All(
+            vol.Optional(label_enable_new, default=current_enable_new): selector.BooleanSelector(),
+            vol.Optional(label_scan_interval, default=current_interval): vol.All(
                 vol.Coerce(int), vol.Range(min=5, max=3600)
             ),
-            vol.Optional(CONF_AP_DETAIL_INTERVAL, default=current_ap_interval): vol.All(
+            vol.Optional(label_ap_detail, default=current_ap_interval): vol.All(
                 vol.Coerce(int), vol.Range(min=60, max=86400)
             ),
         }
 
         if mac_choices:
-            fields[vol.Optional(CONF_DETAILED_MACS, default=current_detailed)] = cv.multi_select(
+            fields[vol.Optional(label_detailed_macs, default=current_detailed)] = cv.multi_select(
                 mac_choices
             )
 

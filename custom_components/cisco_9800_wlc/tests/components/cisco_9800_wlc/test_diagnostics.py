@@ -1,6 +1,8 @@
 """Tests for diagnostics output."""
 from __future__ import annotations
 
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
+
 from tests.common import MockConfigEntry
 
 from custom_components.cisco_9800_wlc import diagnostics
@@ -30,6 +32,11 @@ async def test_diagnostics_sanitizes_clients(hass):
         domain=DOMAIN,
         entry_id="entry_1",
         title="Test WLC",
+        data={
+            CONF_HOST: "wlc.example.com",
+            CONF_USERNAME: "admin",
+            CONF_PASSWORD: "secret",
+        },
         options={CONF_DETAILED_MACS: ["aa:bb:cc:dd:ee:ff"]},
     )
     coordinator = DummyCoordinator()
@@ -43,3 +50,5 @@ async def test_diagnostics_sanitizes_clients(hass):
     client = result["clients"]["aa:bb:cc:dd:ee:ff"]
     assert client["username"] == "**REDACTED**"
     assert client["attributes_updated"] == "**REDACTED**"
+    assert result["entry"]["data"][CONF_USERNAME] == "**REDACTED**"
+    assert result["entry"]["data"][CONF_PASSWORD] == "**REDACTED**"

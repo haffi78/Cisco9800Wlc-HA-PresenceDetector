@@ -1,5 +1,6 @@
 """coordinator.py"""
 import json
+import copy
 import logging
 import aiohttp
 import asyncio
@@ -635,10 +636,18 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 _LOGGER.debug("Failed to fetch AP environmental sensors during first run: %s", err)
                 ap_sensors = {}
 
-            if ap_sensors:
-                updated["ap_sensors"] = ap_sensors
+            merged_sensors: dict[str, dict[str, Any]] = {}
+            if isinstance(self.data, dict):
+                existing_sensors = self.data.get("ap_sensors")
+                if isinstance(existing_sensors, dict):
+                    merged_sensors.update(existing_sensors)
+            if isinstance(ap_sensors, dict):
+                for mac, payload in ap_sensors.items():
+                    if isinstance(payload, dict):
+                        merged_sensors[mac] = payload
+            updated["ap_sensors"] = merged_sensors
 
-            await self._async_update_ap_devices(updated, ap_sensors)
+            await self._async_update_ap_devices(updated, merged_sensors)
 
             # Return the full updated data to the coordinator
             return updated
@@ -890,10 +899,18 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 _LOGGER.debug("Failed to fetch AP environmental sensors: %s", err)
                 ap_sensors = {}
 
-            if ap_sensors:
-                updated.setdefault("ap_sensors", ap_sensors)
+            merged_sensors: dict[str, dict[str, Any]] = {}
+            if isinstance(self.data, dict):
+                existing_sensors = self.data.get("ap_sensors")
+                if isinstance(existing_sensors, dict):
+                    merged_sensors.update(existing_sensors)
+            if isinstance(ap_sensors, dict):
+                for mac, payload in ap_sensors.items():
+                    if isinstance(payload, dict):
+                        merged_sensors[mac] = payload
+            updated["ap_sensors"] = merged_sensors
 
-            await self._async_update_ap_devices(updated, ap_sensors)
+            await self._async_update_ap_devices(updated, merged_sensors)
 
             # Persist last-known attributes (excluding controller status)
             try:
@@ -1631,7 +1648,10 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     record[key] = value
 
         if self._ap_device_cache:
-            target["ap_devices"] = self._ap_device_cache
+            target["ap_devices"] = {
+                mac: copy.deepcopy(record)
+                for mac, record in self._ap_device_cache.items()
+            }
 
         if should_fetch and self._ap_device_cache:
             names = [record.get("name") or ap_mac for ap_mac, record in self._ap_device_cache.items()]

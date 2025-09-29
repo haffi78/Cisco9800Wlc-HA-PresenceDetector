@@ -239,9 +239,11 @@ async def async_setup_entry(
     if entry.options.get("disable_polling", False):
         _LOGGER.info("Polling is disabled in options; manual refresh only")
         coordinator.update_interval = None  # Disable automatic updates
+        coordinator.set_manual_refresh_mode(True)
     else:
         # Respect the coordinator's configured interval (set in coordinator.py)
         _LOGGER.debug("Polling is enabled; using coordinator interval: %s", coordinator.update_interval)
+        coordinator.set_manual_refresh_mode(False)
 
     # Track which MACs have entities already added
     tracked_entries = domain_data.setdefault("tracked_macs", {})

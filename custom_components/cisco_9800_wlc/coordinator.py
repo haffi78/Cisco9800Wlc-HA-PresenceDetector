@@ -4,6 +4,7 @@ import logging
 import aiohttp
 import asyncio
 import re
+from contextlib import suppress
 from typing import Any
 from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
@@ -239,6 +240,12 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         self._ap_mac_aliases: dict[str, str] = {}
         self._ap_name_map: dict[str, str] = {}
 
+        # Manual refresh management (for environments/AP metadata when client polling is disabled)
+        self._manual_refresh_mode = False
+        self._manual_env_task: asyncio.Task | None = None
+        self._manual_ap_task: asyncio.Task | None = None
+        self._scan_interval_seconds = max(5, int(interval_value))
+
     def _set_wlc_status(
         self,
         online: bool | None = None,
@@ -354,23 +361,120 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         else:
             self._enrich_worker_task.add_done_callback(lambda _: None)
 
+    def set_manual_refresh_mode(self, enabled: bool) -> None:
+        """Enable or disable manual refresh loops for AP data."""
+
+        if enabled == self._manual_refresh_mode:
+            return
+
+        self._manual_refresh_mode = enabled
+
+        if enabled:
+            if self._manual_env_task is None or self._manual_env_task.done():
+                self._manual_env_task = self.hass.loop.create_task(
+                    self._manual_environment_refresh_loop()
+                )
+            if self._ap_detail_interval > 0 and (
+                self._manual_ap_task is None or self._manual_ap_task.done()
+            ):
+                self._manual_ap_task = self.hass.loop.create_task(
+                    self._manual_ap_metadata_refresh_loop()
+                )
+            _LOGGER.debug("Manual AP refresh mode enabled")
+            return
+
+        # Disable mode: cancel background tasks
+        for task_attr in ("_manual_env_task", "_manual_ap_task"):
+            task = getattr(self, task_attr)
+            if task and not task.done():
+                task.cancel()
+        self._manual_env_task = None
+        self._manual_ap_task = None
+        _LOGGER.debug("Manual AP refresh mode disabled")
+
+    async def _manual_environment_refresh_loop(self) -> None:
+        """Refresh environmental telemetry on a fixed cadence when manual mode is enabled."""
+
+        try:
+            while True:
+                try:
+                    await self._refresh_environment_snapshot()
+                except Exception as err:  # pragma: no cover - defensive
+                    _LOGGER.debug("Manual environment refresh failed: %s", err)
+                try:
+                    await asyncio.sleep(self._scan_interval_seconds)
+                except asyncio.CancelledError:
+                    raise
+        except asyncio.CancelledError:
+            _LOGGER.debug("Manual environment refresh loop stopped")
+            raise
+
+    async def _manual_ap_metadata_refresh_loop(self) -> None:
+        """Refresh AP metadata based on the configured detail interval."""
+
+        try:
+            while True:
+                try:
+                    await self._refresh_ap_metadata_snapshot()
+                except Exception as err:  # pragma: no cover - defensive
+                    _LOGGER.debug("Manual AP metadata refresh failed: %s", err)
+                interval = max(60, self._ap_detail_interval)
+                try:
+                    await asyncio.sleep(interval)
+                except asyncio.CancelledError:
+                    raise
+        except asyncio.CancelledError:
+            _LOGGER.debug("Manual AP metadata loop stopped")
+            raise
+
+    async def _refresh_environment_snapshot(self) -> None:
+        """Fetch environmental telemetry and push it to Home Assistant."""
+
+        ap_sensors: dict[str, dict[str, Any]] = {}
+        try:
+            ap_sensors = await self._async_fetch_ap_environment()
+        except Exception as err:  # pragma: no cover - defensive
+            _LOGGER.debug("Failed to fetch AP environmental data during manual refresh: %s", err)
+
+        base = dict(self.data) if isinstance(self.data, dict) else {}
+        if ap_sensors:
+            base["ap_sensors"] = ap_sensors
+
+        await self._async_update_ap_devices(base, ap_sensors, force_fetch=False)
+        self.async_set_updated_data(base)
+
+    async def _refresh_ap_metadata_snapshot(self) -> None:
+        """Force an AP metadata refresh and push results to Home Assistant."""
+
+        base = dict(self.data) if isinstance(self.data, dict) else {}
+        sensors_data = base.get("ap_sensors")
+        ap_sensors = sensors_data if isinstance(sensors_data, dict) else {}
+
+        await self._async_update_ap_devices(base, ap_sensors, force_fetch=True)
+        if self._ap_device_cache:
+            self.async_set_updated_data(base)
+
     async def async_shutdown(self) -> None:
         """Cancel background work cleanly."""
         if self._enrich_worker_task and not self._enrich_worker_task.done():
             _LOGGER.debug("Cancelling enrichment worker")
             self._enrich_worker_task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await self._enrich_worker_task
-            except asyncio.CancelledError:
-                pass
         self._enrich_worker_task = None
+
+        for task in (self._manual_env_task, self._manual_ap_task):
+            if task and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+        self._manual_env_task = None
+        self._manual_ap_task = None
 
         if self._pending_status_save and not self._pending_status_save.done():
             self._pending_status_save.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await self._pending_status_save
-            except asyncio.CancelledError:
-                pass
         self._pending_status_save = None
 
     async def _enrich_worker(self):
@@ -1594,13 +1698,17 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         return devices
 
     async def _async_update_ap_devices(
-        self, target: dict[str, Any], ap_sensors: dict[str, dict[str, Any]]
+        self,
+        target: dict[str, Any],
+        ap_sensors: dict[str, dict[str, Any]] | None,
+        *,
+        force_fetch: bool = False,
     ) -> None:
         """Refresh cached AP metadata and merge environmental data."""
 
         now = datetime.now()
-        should_fetch = False
-        if self._ap_detail_interval > 0:
+        should_fetch = force_fetch
+        if not should_fetch and self._ap_detail_interval > 0:
             if (
                 self._ap_detail_next_fetch is None
                 or now >= self._ap_detail_next_fetch
@@ -1615,6 +1723,8 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     self._ap_device_cache = devices
             except Exception as err:  # pragma: no cover - defensive
                 _LOGGER.debug("Failed to fetch AP metadata: %s", err)
+            self._ap_detail_next_fetch = now + timedelta(seconds=self._ap_detail_interval)
+        elif self._ap_detail_next_fetch is None and self._ap_detail_interval > 0:
             self._ap_detail_next_fetch = now + timedelta(seconds=self._ap_detail_interval)
 
         if isinstance(ap_sensors, dict):

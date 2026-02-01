@@ -14,6 +14,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import CiscoWLCUpdateCoordinator
+from .utils import build_https_url
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -108,7 +109,7 @@ class _BaseAPButton(CoordinatorEntity[CiscoWLCUpdateCoordinator], ButtonEntity):
         config_url = None
         ip_address = record.get("ip_address")
         if isinstance(ip_address, str) and ip_address:
-            config_url = f"https://{ip_address}"
+            config_url = build_https_url(ip_address)
         friendly_name = record.get("name") or f"AP {self._ap_mac.upper()}"
         return DeviceInfo(
             identifiers={(DOMAIN, f"ap-{self._ap_mac}")},

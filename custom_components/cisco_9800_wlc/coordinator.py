@@ -17,6 +17,7 @@ from .const import (
     CONF_AP_DETAIL_INTERVAL,
     DEFAULT_AP_DETAIL_INTERVAL,
 )
+from .utils import build_https_url
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -198,8 +199,8 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         self.verify_ssl = not config.get(CONF_IGNORE_SSL, False)
         self.entry_id = entry_id
 
-        self.api_url = f"https://{self.host}/restconf/data"
-        self.operations_url = f"https://{self.host}/restconf/operations"
+        self.api_url = build_https_url(self.host, "/restconf/data")
+        self.operations_url = build_https_url(self.host, "/restconf/operations")
         self.data = {}
         self.session = async_get_clientsession(hass, verify_ssl=self.verify_ssl)
         self.api_semaphore = asyncio.Semaphore(5)  # Limit concurrent API requests to 5

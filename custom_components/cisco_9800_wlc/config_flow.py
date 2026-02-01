@@ -24,6 +24,7 @@ from .const import (
     DEFAULT_AP_DETAIL_INTERVAL,
 )
 from .coordinator import DEFAULT_SCAN_INTERVAL, CiscoWLCUpdateCoordinator
+from .utils import build_https_url
 
 MAC_REGEX_COLON = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 MAC_REGEX_HYPHEN = re.compile(r"^([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$")
@@ -88,7 +89,7 @@ class CiscoWLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self.hass,
             verify_ssl=not ignore_ssl,
         )
-        url = f"https://{host}/restconf/data"
+        url = build_https_url(host, "/restconf/data")
         auth = aiohttp.BasicAuth(username, password)
         headers = {"Accept": "application/yang-data+json"}
 

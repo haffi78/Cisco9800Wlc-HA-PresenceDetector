@@ -17,6 +17,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import CiscoWLCUpdateCoordinator
+from .utils import build_https_url
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ class CiscoWLCStatusBinarySensor(
             manufacturer="Cisco",
             model="9800 Series Wireless Controller",
             sw_version=sw_raw,
-            configuration_url=f"https://{self._entry.data['host']}",
+            configuration_url=build_https_url(self._entry.data["host"]),
         )
 
 

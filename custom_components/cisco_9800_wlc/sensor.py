@@ -21,6 +21,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import CiscoWLCUpdateCoordinator
+from .utils import build_https_url
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -226,7 +227,7 @@ class CiscoWLCVersionSensor(
             manufacturer="Cisco",
             model="9800 Series Wireless Controller",
             sw_version=sw_value,
-            configuration_url=f"https://{self._entry.data['host']}",
+            configuration_url=build_https_url(self._entry.data["host"]),
         )
 
     def _handle_coordinator_update(self) -> None:
@@ -327,7 +328,7 @@ class CiscoWLCAPEnvironmentSensor(
         ip_address = record.get("ip_address")
         config_url = None
         if isinstance(ip_address, str) and ip_address:
-            config_url = f"https://{ip_address}"
+            config_url = build_https_url(ip_address)
         return DeviceInfo(
             identifiers={(DOMAIN, f"ap-{self._ap_mac}")},
             name=self._display_name(),
@@ -503,7 +504,7 @@ class CiscoWLCAPStatusSensor(
         ip_address = record.get("ip_address")
         config_url = None
         if isinstance(ip_address, str) and ip_address:
-            config_url = f"https://{ip_address}"
+            config_url = build_https_url(ip_address)
         return DeviceInfo(
             identifiers={(DOMAIN, f"ap-{self._ap_mac}")},
             name=_format_ap_display_name(record.get("name"), self._ap_mac),
@@ -593,7 +594,7 @@ class CiscoWLCAPRadioSensor(
         ip_address = ap_record.get("ip_address")
         config_url = None
         if isinstance(ip_address, str) and ip_address:
-            config_url = f"https://{ip_address}"
+            config_url = build_https_url(ip_address)
         return DeviceInfo(
             identifiers={(DOMAIN, f"ap-{self._ap_mac}")},
             name=friendly,

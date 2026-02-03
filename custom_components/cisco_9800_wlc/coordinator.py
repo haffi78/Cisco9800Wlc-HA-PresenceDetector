@@ -52,6 +52,15 @@ PER_CLIENT_URLS = {
     "roaming_history": "/Cisco-IOS-XE-wireless-client-oper:client-oper-data/mm-if-client-history={mac}/mobility-history",
 }
 
+async def _safe_response_text(response) -> str:
+    """Read response text without raising on bad encodings."""
+    try:
+        return await response.text()
+    except UnicodeDecodeError:
+        raw = await response.read()
+        encoding = response.charset or "utf-8"
+        return raw.decode(encoding, errors="replace")
+
 def _is_meaningful(value) -> bool:
     """Return True if value is meaningful (not empty/placeholder).
 
@@ -479,11 +488,11 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                             _LOGGER.debug("GET %s -> %s (JSON, unserializable)", url, status)
                     return status, data, None
                 except Exception as json_err:
-                    text = await response.text()
+                    text = await _safe_response_text(response)
                     _LOGGER.error(f"JSON Parsing Error for {url}: {json_err} - Response: {text}")
                     return status, None, text
             else:
-                text = await response.text()
+                text = await _safe_response_text(response)
                 if status == 401:
                     raise ConfigEntryAuthFailed("Invalid credentials")
                 if _LOGGER.isEnabledFor(logging.DEBUG) and DEBUG_LOG_PAYLOADS:
@@ -519,7 +528,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 json=payload,
                 timeout=timeout,
             ) as response:
-                text = await response.text()
+                text = await _safe_response_text(response)
                 data: Any | None = None
                 if response.content_type and "json" in response.content_type:
                     try:
@@ -572,7 +581,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     return self.data
 
                 if response.status == 401:
-                    response_text = await response.text()
+                    response_text = await _safe_response_text(response)
                     _LOGGER.error(
                         "Authentication failed fetching client list: HTTP 401 - %s",
                         response_text,
@@ -581,13 +590,13 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     raise ConfigEntryAuthFailed("Invalid credentials")
 
                 if response.status != 200:
-                    response_text = await response.text()
+                    response_text = await _safe_response_text(response)
                     _LOGGER.error(f"HTTP {response.status}: Error fetching client list - {response_text}")
                     # Mark controller Offline on client fetch failure
                     self._set_wlc_status(online=False, push=True)
                     raise UpdateFailed(f"HTTP {response.status}: {response_text}")
 
-                response_text = await response.text()
+                response_text = await _safe_response_text(response)
                 try:
                     data = json.loads(response_text)
                 except Exception as json_err:
@@ -697,7 +706,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     return self.data
 
                 if response.status == 401:
-                    response_text = await response.text()
+                    response_text = await _safe_response_text(response)
                     _LOGGER.error(
                         "Authentication failed fetching client list: HTTP 401 - %s",
                         response_text,
@@ -706,12 +715,12 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     raise ConfigEntryAuthFailed("Invalid credentials")
 
                 if response.status != 200:
-                    response_text = await response.text()
+                    response_text = await _safe_response_text(response)
                     _LOGGER.error(f"HTTP {response.status}: Error fetching client list - {response_text}")
                     self._set_wlc_status(online=False, push=True)
                     raise UpdateFailed(f"HTTP {response.status}: {response_text}")
 
-                response_text = await response.text()
+                response_text = await _safe_response_text(response)
                 try:
                     data = json.loads(response_text)
                 except Exception as json_err:
@@ -995,7 +1004,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     status_url, headers=headers, auth=self.auth, timeout=STATUS_TIMEOUT
                 ) as response:
                     if response.status == 401:
-                        response_text = await response.text()
+                        response_text = await _safe_response_text(response)
                         _LOGGER.error(
                             "Authentication failed fetching WLC status: HTTP 401 - %s",
                             response_text,
@@ -1003,7 +1012,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                         raise ConfigEntryAuthFailed("Invalid credentials")
 
                     if response.status != 200:
-                        response_text = await response.text()
+                        response_text = await _safe_response_text(response)
                         _LOGGER.debug("HTTP %s: Error fetching WLC status - %s", response.status, response_text)
                         # Do not flip connectivity on version fetch errors; keep previous status
                         return

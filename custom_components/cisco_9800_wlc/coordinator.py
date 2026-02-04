@@ -52,14 +52,50 @@ PER_CLIENT_URLS = {
     "roaming_history": "/Cisco-IOS-XE-wireless-client-oper:client-oper-data/mm-if-client-history={mac}/mobility-history",
 }
 
+def _preferred_encodings(charset: str | None) -> list[str]:
+    encodings: list[str] = []
+    if charset:
+        encodings.append(charset)
+    if "utf-8" not in encodings:
+        encodings.append("utf-8")
+    if "latin-1" not in encodings:
+        encodings.append("latin-1")
+    return encodings
+
+
+def _decode_bytes(raw: bytes, charset: str | None) -> str:
+    if not raw:
+        return ""
+    for encoding in _preferred_encodings(charset):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    fallback = charset or "utf-8"
+    return raw.decode(fallback, errors="replace")
+
+
+def _parse_json_bytes(raw: bytes, charset: str | None) -> tuple[Any | None, str, Exception | None]:
+    if not raw:
+        return None, "", ValueError("Empty response body")
+    last_decode_err: Exception | None = None
+    for encoding in _preferred_encodings(charset):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError as err:
+            last_decode_err = err
+            continue
+        try:
+            return json.loads(text), text, None
+        except json.JSONDecodeError as err:
+            return None, text, err
+    return None, _decode_bytes(raw, charset), last_decode_err or ValueError("Failed to decode response body")
+
+
 async def _safe_response_text(response) -> str:
     """Read response text without raising on bad encodings."""
-    try:
-        return await response.text()
-    except UnicodeDecodeError:
-        raw = await response.read()
-        encoding = response.charset or "utf-8"
-        return raw.decode(encoding, errors="replace")
+    raw = await response.read()
+    return _decode_bytes(raw, response.charset)
 
 def _is_meaningful(value) -> bool:
     """Return True if value is meaningful (not empty/placeholder).
@@ -475,9 +511,10 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         headers = {"Accept": "application/yang-data+json"}
         async with self.session.get(url, headers=headers, auth=self.auth, timeout=timeout) as response:
             status = response.status
+            raw = await response.read()
             if status == 200:
-                try:
-                    data = await response.json()
+                data, text, json_err = _parse_json_bytes(raw, response.charset)
+                if data is not None:
                     if _LOGGER.isEnabledFor(logging.DEBUG) and DEBUG_LOG_PAYLOADS:
                         try:
                             payload = json.dumps(data, ensure_ascii=False)
@@ -487,18 +524,15 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                         except Exception:
                             _LOGGER.debug("GET %s -> %s (JSON, unserializable)", url, status)
                     return status, data, None
-                except Exception as json_err:
-                    text = await _safe_response_text(response)
-                    _LOGGER.error(f"JSON Parsing Error for {url}: {json_err} - Response: {text}")
-                    return status, None, text
-            else:
-                text = await _safe_response_text(response)
-                if status == 401:
-                    raise ConfigEntryAuthFailed("Invalid credentials")
-                if _LOGGER.isEnabledFor(logging.DEBUG) and DEBUG_LOG_PAYLOADS:
-                    trimmed = text if len(text) <= DEBUG_PAYLOAD_MAX_CHARS else text[:DEBUG_PAYLOAD_MAX_CHARS] + " …(truncated)"
-                    _LOGGER.debug("GET %s -> %s TEXT: %s", url, status, trimmed)
+                _LOGGER.error("JSON Parsing Error for %s: %s - Response: %s", url, json_err, text)
                 return status, None, text
+            text = _decode_bytes(raw, response.charset)
+            if status == 401:
+                raise ConfigEntryAuthFailed("Invalid credentials")
+            if _LOGGER.isEnabledFor(logging.DEBUG) and DEBUG_LOG_PAYLOADS:
+                trimmed = text if len(text) <= DEBUG_PAYLOAD_MAX_CHARS else text[:DEBUG_PAYLOAD_MAX_CHARS] + " …(truncated)"
+                _LOGGER.debug("GET %s -> %s TEXT: %s", url, status, trimmed)
+            return status, None, text
 
     async def _post_operation(
         self, endpoint: str, payload: dict[str, Any], *, timeout: int = 10

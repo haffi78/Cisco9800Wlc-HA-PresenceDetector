@@ -88,8 +88,18 @@ def _parse_json_bytes(raw: bytes, charset: str | None) -> tuple[Any | None, str,
         try:
             return json.loads(text), text, None
         except json.JSONDecodeError as err:
-            return None, text, err
-    return None, _decode_bytes(raw, charset), last_decode_err or ValueError("Failed to decode response body")
+            # Retry with replacement chars for control bytes (common in bad UTF-8 payloads).
+            try:
+                replaced = raw.decode(encoding, errors="replace")
+                return json.loads(replaced), replaced, None
+            except Exception:
+                return None, text, err
+    # Last-chance: decode with replacement and try JSON parsing.
+    replaced = _decode_bytes(raw, charset)
+    try:
+        return json.loads(replaced), replaced, None
+    except Exception as err:
+        return None, replaced, last_decode_err or err or ValueError("Failed to decode response body")
 
 
 async def _safe_response_text(response) -> str:

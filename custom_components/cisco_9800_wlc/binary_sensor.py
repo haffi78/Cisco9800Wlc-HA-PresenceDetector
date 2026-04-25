@@ -48,7 +48,7 @@ class CiscoWLCStatusBinarySensor(
     ) -> None:
         super().__init__(coordinator)
         self._entry = config_entry
-        self._attr_unique_id = f"{DOMAIN}_controller_status"
+        self._attr_unique_id = f"{config_entry.entry_id}_{self.entity_description.key}"
         self._attr_name = None
 
     @property

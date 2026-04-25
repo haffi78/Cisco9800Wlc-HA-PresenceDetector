@@ -1,0 +1,4 @@
+*.json
+!.gitignore
+!README.txt
+!capture_fixtures.sh

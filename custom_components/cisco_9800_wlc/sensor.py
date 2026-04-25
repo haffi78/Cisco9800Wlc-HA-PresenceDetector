@@ -39,6 +39,12 @@ def _format_ap_display_name(raw_name: Any, ap_mac: str) -> str:
     return f"AP-{base}"
 
 
+def _native_number(value: Any) -> int | float | None:
+    """Return a numeric state already prepared by the coordinator."""
+
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
 @dataclass
 class CiscoWLCSensorEntityDescription(SensorEntityDescription):
     """Describes a Cisco WLC sensor."""
@@ -113,6 +119,7 @@ AP_DEVICE_SENSOR_DESCRIPTIONS: tuple[CiscoWLCAPDeviceSensorDescription, ...] = (
         translation_key="ap_clients",
         icon="mdi:account-multiple",
         state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=0,
         value_field="client_count",
     ),
     CiscoWLCAPDeviceSensorDescription(
@@ -121,6 +128,7 @@ AP_DEVICE_SENSOR_DESCRIPTIONS: tuple[CiscoWLCAPDeviceSensorDescription, ...] = (
         translation_key="ap_clients_24ghz",
         icon="mdi:access-point",
         state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=0,
         value_field="clients_24ghz",
     ),
     CiscoWLCAPDeviceSensorDescription(
@@ -129,6 +137,7 @@ AP_DEVICE_SENSOR_DESCRIPTIONS: tuple[CiscoWLCAPDeviceSensorDescription, ...] = (
         translation_key="ap_clients_5ghz",
         icon="mdi:access-point",
         state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=0,
         value_field="clients_5ghz",
     ),
     CiscoWLCAPDeviceSensorDescription(
@@ -137,6 +146,7 @@ AP_DEVICE_SENSOR_DESCRIPTIONS: tuple[CiscoWLCAPDeviceSensorDescription, ...] = (
         translation_key="ap_clients_6ghz",
         icon="mdi:access-point",
         state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=0,
         value_field="clients_6ghz",
     ),
 )
@@ -149,6 +159,7 @@ AP_RADIO_SENSOR_DESCRIPTIONS: tuple[CiscoWLCAPRadioSensorDescription, ...] = (
         translation_key="ap_radio_channel",
         icon="mdi:access-point",
         state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=0,
         value_field="channel",
     ),
     CiscoWLCAPRadioSensorDescription(
@@ -158,6 +169,7 @@ AP_RADIO_SENSOR_DESCRIPTIONS: tuple[CiscoWLCAPRadioSensorDescription, ...] = (
         icon="mdi:signal",
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="MHz",
+        suggested_display_precision=0,
         value_field="channel_width_mhz",
     ),
     CiscoWLCAPRadioSensorDescription(
@@ -167,6 +179,7 @@ AP_RADIO_SENSOR_DESCRIPTIONS: tuple[CiscoWLCAPRadioSensorDescription, ...] = (
         icon="mdi:signal-cellular-3",
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="dBm",
+        suggested_display_precision=0,
         value_field="tx_power_dbm",
     ),
 )
@@ -300,14 +313,9 @@ class CiscoWLCAPEnvironmentSensor(
         return _format_ap_display_name(name, self._ap_mac)
 
     @property
-    def native_value(self) -> float | None:
+    def native_value(self) -> int | float | None:
         value = self._ap_record().get(self.entity_description.value_field)
-        if value is None:
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
+        return _native_number(value)
 
     @property
     def extra_state_attributes(self) -> dict:
@@ -376,15 +384,10 @@ class CiscoWLCAPDeviceSensor(
         return _format_ap_display_name(record.get("name"), self._ap_mac)
 
     @property
-    def native_value(self) -> float | None:
+    def native_value(self) -> int | float | None:
         record = self._ap_record()
         value = record.get(self.entity_description.value_field)
-        if value is None:
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
+        return _native_number(value)
 
     @property
     def extra_state_attributes(self) -> dict:
@@ -566,15 +569,10 @@ class CiscoWLCAPRadioSensor(
         return f"{base} Slot {self._slot}"
 
     @property
-    def native_value(self) -> float | None:
+    def native_value(self) -> int | float | None:
         _, radio = self._radio_record()
         value = radio.get(self.entity_description.value_field)
-        if value is None:
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
+        return _native_number(value)
 
     @property
     def extra_state_attributes(self) -> dict:

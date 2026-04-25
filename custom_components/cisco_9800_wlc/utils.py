@@ -4,6 +4,39 @@ from __future__ import annotations
 from ipaddress import ip_address
 from urllib.parse import quote
 
+CLIENT_UNIQUE_ID_SEPARATOR = "_"
+
+
+def normalize_controller_identifier(host: str) -> str:
+    """Return the stable controller identifier used for entity unique IDs."""
+
+    return str(host or "").strip().lower() or "unknown"
+
+
+def build_client_unique_id(controller_identifier: str, mac: str) -> str:
+    """Return a WLC-scoped unique ID for a tracked client."""
+
+    return (
+        f"{normalize_controller_identifier(controller_identifier)}"
+        f"{CLIENT_UNIQUE_ID_SEPARATOR}{str(mac or '').strip().lower()}"
+    )
+
+
+def build_client_device_identifier(controller_identifier: str, mac: str) -> str:
+    """Return a WLC-scoped device registry identifier for a tracked client."""
+
+    return (
+        f"{normalize_controller_identifier(controller_identifier)}"
+        f"{CLIENT_UNIQUE_ID_SEPARATOR}client"
+        f"{CLIENT_UNIQUE_ID_SEPARATOR}{str(mac or '').strip().lower()}"
+    )
+
+
+def client_mac_from_unique_id(unique_id: str) -> str:
+    """Return the MAC-looking tail from a client unique ID."""
+
+    return str(unique_id or "").strip().lower().rsplit(CLIENT_UNIQUE_ID_SEPARATOR, 1)[-1]
+
 
 def _split_ipv6_zone(value: str) -> tuple[str, str | None]:
     if "%" in value:

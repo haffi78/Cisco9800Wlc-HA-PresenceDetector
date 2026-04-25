@@ -17,7 +17,7 @@ from .const import (
     CONF_AP_DETAIL_INTERVAL,
     DEFAULT_AP_DETAIL_INTERVAL,
 )
-from .utils import build_https_url
+from .utils import build_https_url, client_mac_from_unique_id
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -123,6 +123,13 @@ def _is_meaningful(value) -> bool:
         if lowered in {"unknown", "n/a", "na"}:
             return False
     return True
+
+
+def _debug_value(value: Any) -> str:
+    """Return a compact value/type string for debug logs."""
+
+    return f"{value!r} ({type(value).__name__})"
+
 
 def parse_to_local_datetime(value):
     """Parse various time formats to a timezone-aware local datetime.
@@ -1196,9 +1203,16 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     if last_update:
                         record["temperature_last_update"] = last_update
                 else:
-                    iaq = _to_float(entry.get("iaq"))
+                    raw_iaq = entry.get("iaq")
+                    iaq = _to_float(raw_iaq)
                     if iaq is not None:
                         record["iaq"] = iaq
+                        _LOGGER.debug(
+                            "AP metric ingest: ap=%s iaq %s -> %s",
+                            mac,
+                            _debug_value(raw_iaq),
+                            _debug_value(record["iaq"]),
+                        )
                     tvoc = _to_float(entry.get("tvoc"))
                     if tvoc is not None:
                         record["tvoc"] = tvoc
@@ -1515,8 +1529,19 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             radio_info["band"] = entry.get("current-active-band")
             ht_cfg = entry.get("phy-ht-cfg", {}).get("cfg-data", {})
             if isinstance(ht_cfg, dict):
-                radio_info["channel"] = ht_cfg.get("curr-freq")
-                radio_info["channel_width_mhz"] = ht_cfg.get("chan-width")
+                raw_channel = ht_cfg.get("curr-freq")
+                raw_channel_width = ht_cfg.get("chan-width")
+                radio_info["channel"] = raw_channel
+                radio_info["channel_width_mhz"] = raw_channel_width
+                _LOGGER.debug(
+                    "AP metric ingest: ap=%s slot=%s channel %s -> %s, channel_width_mhz %s -> %s",
+                    ap_mac,
+                    slot_index,
+                    _debug_value(raw_channel),
+                    _debug_value(radio_info["channel"]),
+                    _debug_value(raw_channel_width),
+                    _debug_value(radio_info["channel_width_mhz"]),
+                )
             band_list = entry.get("radio-band-info", []) or []
             band_info = None
             current_band_id = entry.get("current-band-id")
@@ -1530,7 +1555,15 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 radio_info["channel_width_cap"] = band_info.get("dot11ac-channel-width-cap")
                 tx_cfg = band_info.get("phy-tx-pwr-lvl-cfg", {}).get("cfg-data", {})
                 if isinstance(tx_cfg, dict):
-                    radio_info["tx_power_dbm"] = tx_cfg.get("curr-tx-power-in-dbm")
+                    raw_tx_power = tx_cfg.get("curr-tx-power-in-dbm")
+                    radio_info["tx_power_dbm"] = raw_tx_power
+                    _LOGGER.debug(
+                        "AP metric ingest: ap=%s slot=%s tx_power_dbm %s -> %s",
+                        ap_mac,
+                        slot_index,
+                        _debug_value(raw_tx_power),
+                        _debug_value(radio_info["tx_power_dbm"]),
+                    )
 
         for entry in oper_root.get("radio-oper-stats", []) or []:
             if not isinstance(entry, dict):
@@ -1543,7 +1576,8 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 slot_index = int(slot)
             except (TypeError, ValueError):
                 continue
-            client_count = entry.get("aid-user-list")
+            raw_client_count = entry.get("aid-user-list")
+            client_count = raw_client_count
             try:
                 client_count = int(client_count)
             except (TypeError, ValueError):
@@ -1551,6 +1585,13 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             record = devices.setdefault(ap_mac, {"ap_mac": ap_mac})
             radio_info = record.setdefault("radios", {}).setdefault(slot_index, {})
             radio_info["client_count"] = client_count
+            _LOGGER.debug(
+                "AP metric ingest: ap=%s slot=%s client_count %s -> %s",
+                ap_mac,
+                slot_index,
+                _debug_value(raw_client_count),
+                _debug_value(client_count),
+            )
             seen_now.add(ap_mac)
 
         for entry in oper_root.get("ap-sensor-status", []) or []:
@@ -1649,6 +1690,14 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 elif "2" in band and "4" in band:
                     totals["clients_24ghz"] += count
             record.update(totals)
+            _LOGGER.debug(
+                "AP client totals: ap=%s total=%s 2.4ghz=%s 5ghz=%s 6ghz=%s",
+                ap_mac,
+                _debug_value(totals["client_count"]),
+                _debug_value(totals["clients_24ghz"]),
+                _debug_value(totals["clients_5ghz"]),
+                _debug_value(totals["clients_6ghz"]),
+            )
             if ap_mac in seen_now:
                 record["last_seen"] = seen_timestamp
 
@@ -1743,7 +1792,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.debug("Failed to persist snapshot for %s: %s", mac, err)
 
     def get_enabled_tracked_macs(self):
-        """MACs of entities that are enabled (actively tracked)."""
+        """MACs of enabled device trackers for this config entry."""
         entity_registry = er.async_get(self.hass)
         macs: set[str] = set()
         for entity_id, entity in entity_registry.entities.items():
@@ -1751,19 +1800,20 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 entity_id.startswith("device_tracker.")
                 and not entity.disabled
                 and entity.platform == DOMAIN
+                and entity.config_entry_id == self.entry_id
                 and entity.unique_id
             ):
-                normalized_mac = self._normalize_mac(entity.unique_id)
+                normalized_mac = self._mac_from_tracker_unique_id(entity.unique_id)
                 if normalized_mac:
                     macs.add(normalized_mac)
         return macs
 
     def get_registered_macs(self, *, normalized: bool = True):
-        """MACs of all entities registered for this integration (enabled or disabled).
+        """MACs of registered device trackers for this config entry.
 
         When normalized=True (default), MACs are returned in colon-separated form to
-        match options flow expectations. When False, the raw unique_id values are
-        returned in lower-case to align with coordinator data keys.
+        match options flow expectations. When False, the MAC portion of each
+        unique ID is returned in lower-case to align with coordinator data keys.
         """
         entity_registry = er.async_get(self.hass)
         macs: set[str] = set()
@@ -1771,18 +1821,27 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             if (
                 entity_id.startswith("device_tracker.")
                 and entity.platform == DOMAIN
+                and entity.config_entry_id == self.entry_id
                 and entity.unique_id
             ):
-                raw_mac = entity.unique_id.lower()
+                raw_mac = client_mac_from_unique_id(entity.unique_id)
                 if not normalized:
                     macs.add(raw_mac)
                     continue
-                normalized_mac = self._normalize_mac(raw_mac)
+                normalized_mac = self._mac_from_tracker_unique_id(entity.unique_id)
                 if normalized_mac:
                     macs.add(normalized_mac)
                 else:
                     macs.add(raw_mac)
         return macs
+
+    def _mac_from_tracker_unique_id(self, unique_id: str) -> str | None:
+        """Return a MAC from either legacy or WLC-scoped tracker unique IDs."""
+
+        normalized_mac = self._normalize_mac(unique_id)
+        if normalized_mac:
+            return normalized_mac
+        return self._normalize_mac(client_mac_from_unique_id(unique_id))
 ############################################################################################################
 
     async def fetch_attributes(self, mac):

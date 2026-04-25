@@ -74,7 +74,7 @@ async def test_ap_environment_sensor_native_values(hass) -> None:
                 "temperature": 21.86,
                 "humidity": 50.92,
                 "temperature_last_update": "2025-09-27T01:12:19.453981+00:00",
-                "iaq": 2.55,
+                "iaq": 2.57,
                 "air_quality_last_update": "2025-09-27T01:12:48.253801+00:00",
             }
         }
@@ -97,7 +97,9 @@ async def test_ap_environment_sensor_native_values(hass) -> None:
     )
 
     assert temp_sensor.native_value == 21.86
-    assert air_sensor.native_value == 2.55
+    assert air_sensor.native_value == 2.57
+    assert isinstance(air_sensor.native_value, float)
+    assert air_quality_description.suggested_display_precision is None
     assert temp_sensor.device_info["identifiers"] == {(DOMAIN, "ap-34:5d:a8:0a:2e:40")}
     assert temp_sensor.device_info["name"] == "AP-34:5D:A8:0A:2E:40"
 
@@ -207,12 +209,40 @@ async def test_ap_device_and_radio_sensors(hass) -> None:
         0,
         radio_description,
     )
+    radio_width_sensor = CiscoWLCAPRadioSensor(
+        coordinator,
+        entry,
+        "34:5d:a8:0a:2e:40",
+        0,
+        AP_RADIO_SENSOR_DESCRIPTIONS[1],
+    )
+    radio_tx_power_sensor = CiscoWLCAPRadioSensor(
+        coordinator,
+        entry,
+        "34:5d:a8:0a:2e:40",
+        0,
+        AP_RADIO_SENSOR_DESCRIPTIONS[2],
+    )
 
     assert device_sensor.native_value == 7
+    assert isinstance(device_sensor.native_value, int)
     assert sensor_24ghz.native_value == 3
     assert sensor_5ghz.native_value == 4
     assert sensor_6ghz.native_value == 0
     assert radio_sensor.native_value == 1
+    assert isinstance(radio_sensor.native_value, int)
+    assert radio_width_sensor.native_value == 20
+    assert isinstance(radio_width_sensor.native_value, int)
+    assert radio_tx_power_sensor.native_value == 12
+    assert isinstance(radio_tx_power_sensor.native_value, int)
+    assert all(
+        description.suggested_display_precision == 0
+        for description in AP_DEVICE_SENSOR_DESCRIPTIONS
+    )
+    assert all(
+        description.suggested_display_precision == 0
+        for description in AP_RADIO_SENSOR_DESCRIPTIONS
+    )
     assert device_sensor.device_info["model"] == "C9166I"
     assert radio_sensor.extra_state_attributes["band"] == "dot11-2-dot-4-ghz-band"
     assert device_sensor.device_info["name"] == "AP-Lab AP"

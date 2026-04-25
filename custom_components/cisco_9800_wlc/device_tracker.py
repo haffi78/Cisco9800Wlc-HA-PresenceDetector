@@ -4,7 +4,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterable, cast
 
-from homeassistant.components.device_tracker import ScannerEntity
+from homeassistant.components.device_tracker import (
+    DOMAIN as DEVICE_TRACKER_DOMAIN,
+    ScannerEntity,
+)
 from homeassistant.components.device_tracker.const import SourceType
 
 from homeassistant.config_entries import ConfigEntry
@@ -18,6 +21,11 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, SIGNAL_NEW_CLIENTS
 from .coordinator import CiscoWLCUpdateCoordinator, parse_to_local_datetime
+from .utils import (
+    build_client_device_identifier,
+    build_client_unique_id,
+    client_mac_from_unique_id,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -60,7 +68,12 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
     @property
     def unique_id(self) -> str:
         """Return a unique ID for the device."""
-        return self.mac  #  Uses MAC as-is, which was working before
+        return build_client_unique_id(self.coordinator.host, self._normalized_mac())
+
+    @property
+    def mac_address(self) -> str:
+        """Return the client MAC address."""
+        return self._normalized_mac()
 
     @property
     def entity_registry_enabled_default(self) -> bool:
@@ -185,6 +198,17 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
             return f"{parts[-2]}:{parts[-1]}"
         return self.mac[-5:]
 
+    def _normalized_mac(self) -> str:
+        normalizer = getattr(self.coordinator, "_normalize_mac", None)
+        normalized = normalizer(self.mac) if callable(normalizer) else None
+        return normalized or self.mac.lower()
+
+    def _device_identifier(self) -> str:
+        return build_client_device_identifier(
+            self.coordinator.host,
+            self._normalized_mac(),
+        )
+
     def _current_friendly_name(self) -> str:
         base = self._base_name()
         suffix = self._mac_suffix()
@@ -202,14 +226,17 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
     def device_info(self) -> DeviceInfo:
         """Return device registry information for this tracked client."""
         return DeviceInfo(
-            connections={(dr.CONNECTION_NETWORK_MAC, self.mac)},
+            identifiers={(DOMAIN, self._device_identifier())},
             name=self._device_registry_label(),
+            via_device=(DOMAIN, self.coordinator.entry_id),
         )
 
     async def _async_update_device_registry_name(self) -> None:
         desired_name = self._device_registry_label()
         device_registry = dr.async_get(self.hass)
-        device = device_registry.async_get_device(connections={(dr.CONNECTION_NETWORK_MAC, self.mac)})
+        device = device_registry.async_get_device(
+            identifiers={(DOMAIN, self._device_identifier())}
+        )
         if device and device.name != desired_name:
             device_registry.async_update_device(device.id, name=desired_name)
 
@@ -275,19 +302,30 @@ async def async_setup_entry(
             and entity_entry.platform == DOMAIN
             and entity_entry.unique_id
         ):
-            # Re-bind orphaned entities (e.g., after config entry re-create) to this entry
             if entity_entry.config_entry_id != entry.entry_id:
-                entity_registry.async_update_entity(
-                    entity_entry.entity_id,
-                    config_entry_id=entry.entry_id,
-                )
+                continue
 
             uid = entity_entry.unique_id.lower()
             normalized_uid = coordinator._normalize_mac(uid)
             if not normalized_uid:
+                normalized_uid = coordinator._normalize_mac(
+                    client_mac_from_unique_id(uid)
+                )
+            if not normalized_uid:
                 _LOGGER.debug("Skipping invalid MAC unique_id %s", uid)
                 continue
-            known_clients.add(uid)
+
+            scoped_uid = build_client_unique_id(coordinator.host, normalized_uid)
+            if uid != scoped_uid and not entity_registry.async_get_entity_id(
+                DEVICE_TRACKER_DOMAIN,
+                DOMAIN,
+                scoped_uid,
+            ):
+                entity_registry.async_update_entity(
+                    entity_entry.entity_id,
+                    new_unique_id=scoped_uid,
+                )
+
             known_clients.add(normalized_uid)
 
     _LOGGER.info(

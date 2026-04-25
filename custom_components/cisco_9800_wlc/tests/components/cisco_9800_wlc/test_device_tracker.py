@@ -80,6 +80,28 @@ def test_client_device_info_is_scoped_to_wlc_entry() -> None:
     assert client.device_info["via_device"] == (DOMAIN, "entry_a")
 
 
+def test_client_attributes_include_ip_versions_and_controller() -> None:
+    mac = "aa:bb:cc:dd:ee:ff"
+    client = _make_client(
+        mac,
+        {
+            "IP Address": "192.0.2.10",
+            "IPv4 Address": "192.0.2.10",
+            "IPv6 Address": "2001:db8::10",
+            "IPv6 Addresses": ["fe80::1", "2001:db8::10"],
+            "Connected to Controller": "wlc-int.example.com",
+        },
+    )
+
+    attrs = client.extra_state_attributes
+
+    assert attrs["IP Address"] == "192.0.2.10"
+    assert attrs["IPv4 Address"] == "192.0.2.10"
+    assert attrs["IPv6 Address"] == "2001:db8::10"
+    assert attrs["IPv6 Addresses"] == ["fe80::1", "2001:db8::10"]
+    assert attrs["Connected to Controller"] == "wlc-int.example.com"
+
+
 async def test_coordinator_registry_lookup_is_scoped_to_config_entry(hass) -> None:
     mac = "aa:bb:cc:dd:ee:ff"
     entry_a = MockConfigEntry(

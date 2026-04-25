@@ -10,6 +10,6 @@
   "integration_type": "hub",
   "icon": "icon.png",
   "logo": "logo.png",
-  "quality_scale": "silver",
+  "quality_scale": "bronze",
   "loggers": ["custom_components.cisco_9800_wlc"]
 }

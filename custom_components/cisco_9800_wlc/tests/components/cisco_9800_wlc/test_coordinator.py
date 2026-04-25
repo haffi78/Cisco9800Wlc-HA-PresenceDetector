@@ -32,6 +32,7 @@ class MockClientResponse:
     def __init__(self, status: int = 200, payload: dict | None = None) -> None:
         self.status = status
         self._payload = payload or {}
+        self.charset = "utf-8"
 
     async def __aenter__(self) -> "MockClientResponse":
         return self
@@ -41,6 +42,9 @@ class MockClientResponse:
 
     async def text(self) -> str:
         return json.dumps(self._payload)
+
+    async def read(self) -> bytes:
+        return json.dumps(self._payload).encode(self.charset)
 
     async def json(self) -> dict:
         return self._payload
@@ -80,6 +84,12 @@ async def test_coordinator_refresh_discovers_new_client(
             {
                 "mac-addr": "aa:bb:cc:dd:ee:ff",
                 "ipv4-binding": {"ip-key": {"ip-addr": "192.0.2.10"}},
+                "ipv6-binding": {
+                    "ip-key": [
+                        {"ip-addr": "2001:db8::10"},
+                        {"ip-addr": "2001:db8::11"},
+                    ],
+                },
             }
         ]
     }
@@ -95,11 +105,54 @@ async def test_coordinator_refresh_discovers_new_client(
         await coordinator.async_config_entry_first_refresh()
 
     assert "aa:bb:cc:dd:ee:ff" in coordinator.data
+    client_data = coordinator.data["aa:bb:cc:dd:ee:ff"]
+    assert client_data["IP Address"] == "192.0.2.10"
+    assert client_data["IPv4 Address"] == "192.0.2.10"
+    assert client_data["IPv6 Address"] == "2001:db8::10"
+    assert client_data["IPv6 Addresses"] == ["2001:db8::10", "2001:db8::11"]
+    assert client_data["Connected to Controller"] == "wlc.example.com"
     mock_dispatch.assert_called_once()
     args = mock_dispatch.call_args[0]
     assert args[0] == hass
     assert args[1] == "cisco_9800_wlc_new_clients"
     assert "aa:bb:cc:dd:ee:ff" in args[3]
+
+
+def test_client_connection_attributes_prefers_non_link_local_ipv6(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Ensure multi-address IPv6 bindings keep all addresses and prefer usable primary."""
+
+    with patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_get_clientsession",
+        return_value=MockSession([]),
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.CiscoWLCUpdateCoordinator._start_enrich_worker",
+        return_value=None,
+    ):
+        coordinator = CiscoWLCUpdateCoordinator(hass, coordinator_config, "entry_ipv6")
+
+    attrs = coordinator._client_connection_attributes(
+        {
+            "mac-addr": "aa:bb:cc:dd:ee:ff",
+            "ipv6-binding": [
+                {"ip-key": {"zone-id": 2147483658, "ip-addr": "fe80::1"}},
+                {"ip-key": {"zone-id": 0, "ip-addr": "fd03:4856:c67c:42ad::10"}},
+                {"ip-key": {"zone-id": 0}},
+                {"ip-key": {"zone-id": 0, "ip-addr": "fd03:4856:c67c:42ad::11"}},
+            ],
+        }
+    )
+
+    assert attrs["IP Address"] == "fd03:4856:c67c:42ad::10"
+    assert attrs["IPv4 Address"] is None
+    assert attrs["IPv6 Address"] == "fd03:4856:c67c:42ad::10"
+    assert attrs["IPv6 Addresses"] == [
+        "fe80::1",
+        "fd03:4856:c67c:42ad::10",
+        "fd03:4856:c67c:42ad::11",
+    ]
+    assert attrs["Connected to Controller"] == "wlc.example.com"
 
 
 @pytest.mark.asyncio

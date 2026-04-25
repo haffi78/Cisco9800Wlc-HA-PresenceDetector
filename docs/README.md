@@ -1,7 +1,7 @@
 # Cisco 9800 WLC Home Assistant Integration
 
 ## Overview
-This custom integration brings Cisco 9800 Wireless LAN Controller data into Home Assistant. It collects connected-client telemetry, access-point metadata, environmental sensor readings, and exposes controller actions such as toggling AP LEDs. The project follows Home Assistant’s silver-quality checklist: every user-facing feature is documented, options have clear defaults, diagnostics are available, and service/command feedback is surfaced through the UI.
+This custom integration brings Cisco 9800 Wireless LAN Controller data into Home Assistant. It collects connected-client telemetry, access-point metadata, environmental sensor readings, and exposes controller actions such as toggling AP LEDs. The project follows Home Assistant’s bronze-quality checklist while continuing to add the documentation, diagnostics, and runtime handling expected of higher tiers.
 
 ## Features
 - **Client presence tracking** – Every connected client is exposed as a `device_tracker` entity with enrichment for device name, OS, RSSI, and optional deep polling per MAC.

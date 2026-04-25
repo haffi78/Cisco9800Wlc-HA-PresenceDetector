@@ -3,7 +3,7 @@ Supported and tested all 9800 Versions post 17.12 to 17.18.2 so far.
 ipv6 is partial supported, not fully tested all features .
 
 ## Overview
-This custom integration brings Cisco 9800 Wireless LAN Controller data into Home Assistant. It collects connected-client telemetry, access-point metadata, environmental sensor readings, and exposes controller actions such as toggling AP LEDs. The project follows Home Assistant’s silver-quality echecklist.
+This custom integration brings Cisco 9800 Wireless LAN Controller data into Home Assistant. It collects connected-client telemetry, access-point metadata, environmental sensor readings, and exposes controller actions such as toggling AP LEDs. The project follows Home Assistant’s bronze-quality checklist.
 
 ## Features
 - **Client presence tracking** – Every connected client is exposed as a `device_tracker` entity with enrichment for device name, OS, RSSI, and optional deep polling per MAC.

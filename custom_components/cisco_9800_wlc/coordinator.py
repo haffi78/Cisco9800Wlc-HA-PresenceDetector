@@ -5,6 +5,7 @@ import logging
 import aiohttp
 import asyncio
 import re
+from ipaddress import ip_address
 from typing import Any
 from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
@@ -36,6 +37,16 @@ DEBUG_PAYLOAD_MAX_CHARS = 10000  # truncate long payloads in debug logs
 ENRICH_RETRY_LIMIT = 3
 ENRICH_DELAY_SECONDS = 0.8
 INITIAL_ENRICH_DELAY_SECONDS = 4.0
+CLIENT_ALWAYS_REPLACE_FIELDS = {
+    "connected",
+    "IP Address",
+    "IPv4 Address",
+    "IPv6 Address",
+    "IPv6 Addresses",
+    "Connected to Controller",
+    "last_seen",
+    "attributes_updated",
+}
 
 # Dispatcher signal name used to announce newly discovered clients (MACs)
 
@@ -129,6 +140,66 @@ def _debug_value(value: Any) -> str:
     """Return a compact value/type string for debug logs."""
 
     return f"{value!r} ({type(value).__name__})"
+
+
+def _extract_ip_addresses(binding: Any) -> list[str]:
+    """Extract IP address values from Cisco client binding payloads."""
+
+    ip_value_keys = {
+        "ip-addr",
+        "ip-address",
+        "ipv4-addr",
+        "ipv4-address",
+        "ipv6-addr",
+        "ipv6-address",
+    }
+    addresses: list[str] = []
+
+    def _collect(value: Any, key: str | None = None) -> None:
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                _collect(child_value, child_key)
+            return
+        if isinstance(value, list):
+            for item in value:
+                _collect(item, key)
+            return
+        if key not in ip_value_keys:
+            return
+        if isinstance(value, (str, int, float)):
+            candidate = str(value).strip()
+            if _is_meaningful(candidate) and candidate not in addresses:
+                addresses.append(candidate)
+
+    if isinstance(binding, (str, int, float)):
+        candidate = str(binding).strip()
+        if _is_meaningful(candidate):
+            return [candidate]
+
+    _collect(binding)
+    return addresses
+
+
+def _is_link_local_ipv6(address: str) -> bool:
+    """Return whether an address is an IPv6 link-local address."""
+
+    try:
+        parsed = ip_address(address)
+    except ValueError:
+        return False
+    return parsed.version == 6 and parsed.is_link_local
+
+
+def _preferred_ip_address(addresses: list[str], *, prefer_non_link_local: bool = False) -> str | None:
+    """Return the best single address from a list of addresses."""
+
+    if not addresses:
+        return None
+    if prefer_non_link_local:
+        for address in addresses:
+            if not _is_link_local_ipv6(address):
+                return address
+    return addresses[0]
 
 
 def parse_to_local_datetime(value):
@@ -669,14 +740,10 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 if not mac:
                     continue  # Skip invalid MACs
 
-                # Extract IPv4 address
-                ip_entry = client.get("ipv4-binding", {}).get("ip-key", {})
-                ipv4_address = ip_entry.get("ip-addr", "N/A")
-
                 # Start with any previously known attributes for this MAC
                 prev_attrs = self.data.get(mac, {}) if isinstance(self.data, dict) else {}
                 merged = dict(prev_attrs)
-                merged["IP Address"] = ipv4_address
+                merged.update(self._client_connection_attributes(client))
 
                 # Stage for further attribute enrichment
                 client_data[mac] = merged
@@ -862,11 +929,8 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 if not mac_raw:
                     continue  # Skip invalid MACs
 
-                ip_entry = client.get("ipv4-binding", {}).get("ip-key", {})
-                ipv4_address = ip_entry.get("ip-addr", "N/A")
-
                 client_data[mac_raw] = {
-                    "IP Address": ipv4_address,
+                    **self._client_connection_attributes(client),
                     "last_seen": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
                     "connected": True,
                 }
@@ -987,7 +1051,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     prev_attrs = existing_cache.get(mac, {}) if isinstance(existing_cache, dict) else {}
                     merged = dict(prev_attrs)
                     for key, value in attrs.items():
-                        if _is_meaningful(value):
+                        if key in CLIENT_ALWAYS_REPLACE_FIELDS or _is_meaningful(value):
                             merged[key] = value
                     merged_cache[mac] = merged
                 await self._client_store.async_save(
@@ -1116,18 +1180,30 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             return ":".join(flat[i:i+2] for i in range(0, 12, 2))
         return None
 
-    def _merge_client_attributes(self, existing: dict[str, Any] | None, updates: dict[str, Any]) -> dict[str, Any]:
-        """Merge new per-scan data with cached attributes without dropping useful values."""
-        always_replace = {
-            "connected",
-            "IP Address",
-            "last_seen",
-            "attributes_updated",
+    def _client_connection_attributes(self, client: dict[str, Any]) -> dict[str, Any]:
+        """Return stable client connection attributes from a SISF client entry."""
+
+        ipv4_addresses = _extract_ip_addresses(client.get("ipv4-binding"))
+        ipv6_addresses = _extract_ip_addresses(client.get("ipv6-binding"))
+        ipv4_address = _preferred_ip_address(ipv4_addresses)
+        ipv6_address = _preferred_ip_address(
+            ipv6_addresses,
+            prefer_non_link_local=True,
+        )
+
+        return {
+            "IP Address": ipv4_address or ipv6_address or "N/A",
+            "IPv4 Address": ipv4_address,
+            "IPv6 Address": ipv6_address,
+            "IPv6 Addresses": ipv6_addresses,
+            "Connected to Controller": self.host,
         }
 
+    def _merge_client_attributes(self, existing: dict[str, Any] | None, updates: dict[str, Any]) -> dict[str, Any]:
+        """Merge new per-scan data with cached attributes without dropping useful values."""
         merged: dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
         for key, value in updates.items():
-            if key in always_replace:
+            if key in CLIENT_ALWAYS_REPLACE_FIELDS:
                 merged[key] = value
             elif _is_meaningful(value):
                 merged[key] = value
@@ -1781,7 +1857,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
             merged = dict(existing_cache.get(mac, {}))
             for key, value in attrs.items():
-                if _is_meaningful(value) or key in {"connected", "IP Address", "last_seen", "attributes_updated"}:
+                if key in CLIENT_ALWAYS_REPLACE_FIELDS or _is_meaningful(value):
                     merged[key] = value
             merged.pop("last_updated_time", None)
 

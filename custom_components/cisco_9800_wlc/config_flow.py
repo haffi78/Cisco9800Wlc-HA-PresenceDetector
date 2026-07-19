@@ -341,7 +341,7 @@ class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
         defaults = {
             "enable_new_entities": "Disable newly discovered devices by default",
             "scan_interval": "Polling interval (seconds)",
-            "ap_detail_interval": "AP metadata refresh interval (seconds)",
+            "ap_detail_interval": "AP inventory/radio refresh interval (seconds)",
             "detailed_macs": "Clients to poll for detailed telemetry",
         }
 

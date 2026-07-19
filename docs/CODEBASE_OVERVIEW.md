@@ -128,11 +128,13 @@ The options flow controls:
   entities are enabled by default. `False` means they are disabled by default.
 
 - `scan_interval`
-  Main client polling interval. The minimum is 5 seconds.
+  Main client polling and AP environmental telemetry interval. The minimum is
+  5 seconds.
 
 - `ap_detail_interval`
-  AP metadata refresh interval. The minimum is 60 seconds. Default is 3600
-  seconds.
+  AP inventory/radio refresh interval for AP identity, join state, radio data,
+  client totals, and CDP/LLDP neighbour data. The minimum is 60 seconds.
+  Default is 3600 seconds.
 
 - `detailed_macs`
   A list of client MACs that should receive detailed per-cycle enrichment.

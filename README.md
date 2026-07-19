@@ -12,7 +12,7 @@ This custom integration brings Cisco 9800 Wireless LAN Controller data into Home
 - **Environmental telemetry** – Temperature, humidity, IAQ, and TVOC sensors are normalised per AP, with EtOH as a disabled-by-default diagnostic sensor and RMOX values exposed as AP Air Quality attributes when reported.
 - **CDP/LLDP insights** – AP entities include attributes describing wired neighbours (device ID, port, platform, management address) for quick topology checks.
 - **LED control** – Per-AP buttons trigger LED on/off commands and start/stop flashing (60 s default) via the controller’s RESTCONF RPCs.
-- **Options UI** – Users can adjust scan cadence, AP detail refresh cadence, and choose clients for deep polling directly from the config entry options.
+- **Options UI** – Users can adjust scan cadence, AP inventory/radio refresh cadence, and choose clients for deep polling directly from the config entry options.
 - **Diagnostics bundle** – Downloadable diagnostics report the current options, cached AP/client state (sanitised), and latest controller responses to assist troubleshooting.
 
 ## AP Air-Quality Values
@@ -41,8 +41,8 @@ This custom integration brings Cisco 9800 Wireless LAN Controller data into Home
 - **Host / Credentials** – Required during setup. Changing them later triggers a re-authentication flow.
 - **Ignore Self-Signed SSL Certificates** – Skip TLS validation for lab controllers (avoid in production).
 - **Disable newly discovered devices by default** – When enabled, new client trackers remain disabled until you manually enable them in the entity registry.
-- **Scan interval (sec)** – Global client polling cadence (default 120 s, minimum 5 s).
-- **AP detail scan interval (sec)** – How often AP metadata (radios, CDP/LLDP, sensors) is refreshed (default 3600 s, minimum 60 s).
+- **Scan interval (sec)** – Global client polling and AP environmental telemetry cadence, including temperature, humidity, IAQ, and TVOC (default 120 s, minimum 5 s).
+- **AP inventory/radio refresh interval (sec)** – How often AP identity, join state, radio details, client totals, and CDP/LLDP neighbour data are refreshed (default 3600 s, minimum 60 s).
 - **Check the detailed MAC addresses** – Multi-select of clients that should receive deep per-cycle polling; leave empty to rely on passive tracking.
 
 ## Entities & Services
@@ -71,6 +71,6 @@ This custom integration brings Cisco 9800 Wireless LAN Controller data into Home
 - **HTTP 401 / authentication failures** – Validate credentials, ensure RESTCONF is enabled, and complete the re-auth prompt when shown.
 - **HTTP 4xx/5xx on LED services** – Check the Home Assistant logs; errors identify the AP and include controller feedback. Confirm the AP is online and the account has config privileges.
 - **Controller overload (HTTP 409)** – Increase the scan interval, reduce detailed MACs, or stagger multiple integrations.
-- **Missing AP data** – Verify the AP appears in the controller RESTCONF API and that the AP detail scan interval is not set too high for your use case.
+- **Missing AP inventory/radio data** – Verify the AP appears in the controller RESTCONF API and that the AP inventory/radio refresh interval is not set too high for your use case.
 
 For questions or bug reports use the GitHub issue tracker linked in the manifest. Contributions—bugs, docs, or new features—are welcomed via pull request.

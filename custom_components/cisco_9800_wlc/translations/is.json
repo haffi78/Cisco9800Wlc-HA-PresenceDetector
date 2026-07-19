@@ -31,7 +31,7 @@
                 "data": {
                     "enable_new_entities": "Gera nýjar uppgötvaðar græjur óvirkar sjálfgefið",
                     "scan_interval": "Tíðni reglulegra kannana (sek.)",
-                    "ap_detail_interval": "Uppfærslutíðni AP-lýsinga (sek.)",
+                    "ap_detail_interval": "Uppfærslutíðni AP-lýsinga/útvarps (sek.)",
                     "detailed_macs": "Veldu viðskiptavini fyrir ítarlega gagnaöflun"
                 }
             }

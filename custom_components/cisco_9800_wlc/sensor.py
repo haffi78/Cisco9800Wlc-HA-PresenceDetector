@@ -13,7 +13,11 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfTemperature
+from homeassistant.const import (
+    PERCENTAGE,
+    UnitOfDensity,
+    UnitOfTemperature,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers import device_registry as dr
@@ -107,6 +111,29 @@ AP_ENVIRONMENT_SENSOR_DESCRIPTIONS: tuple[CiscoWLCAPEnvironmentSensorDescription
         device_class=SensorDeviceClass.AQI,
         state_class=SensorStateClass.MEASUREMENT,
         value_field="iaq",
+        last_update_field="air_quality_last_update",
+    ),
+    CiscoWLCAPEnvironmentSensorDescription(
+        key="ap_air_quality_tvoc",
+        name="TVOC",
+        translation_key="ap_air_quality_tvoc",
+        device_class=SensorDeviceClass.VOLATILE_ORGANIC_COMPOUNDS,
+        icon="mdi:molecule",
+        native_unit_of_measurement=UnitOfDensity.MILLIGRAMS_PER_CUBIC_METER,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=2,
+        value_field="tvoc",
+        last_update_field="air_quality_last_update",
+    ),
+    CiscoWLCAPEnvironmentSensorDescription(
+        key="ap_air_quality_etoh",
+        name="EtOH",
+        translation_key="ap_air_quality_etoh",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:molecule",
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=2,
+        value_field="etoh",
         last_update_field="air_quality_last_update",
     ),
 )
@@ -318,6 +345,12 @@ class CiscoWLCAPEnvironmentSensor(
         return _native_number(value)
 
     @property
+    def entity_registry_enabled_default(self) -> bool:
+        """Return whether this AP environmental entity is enabled by default."""
+
+        return self.entity_description.key != "ap_air_quality_etoh"
+
+    @property
     def extra_state_attributes(self) -> dict:
         record = self._ap_record()
         attrs: dict[str, str | float] = {}
@@ -325,7 +358,7 @@ class CiscoWLCAPEnvironmentSensor(
         if last_update_field and record.get(last_update_field):
             attrs["last_update"] = record[last_update_field]
         if self.entity_description.key == "ap_air_quality":
-            for key in ("tvoc", "etoh"):
+            for key in ("tvoc", "etoh", *(f"rmox-{index}" for index in range(13))):
                 if record.get(key) is not None:
                     attrs[key] = record[key]
         return attrs

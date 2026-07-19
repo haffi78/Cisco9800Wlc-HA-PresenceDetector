@@ -4,6 +4,7 @@ import copy
 import logging
 import aiohttp
 import asyncio
+import math
 import re
 from ipaddress import ip_address
 from typing import Any
@@ -1235,9 +1236,10 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             if value is None:
                 return None
             try:
-                return float(value)
+                numeric = float(value)
             except (TypeError, ValueError):
                 return None
+            return numeric if math.isfinite(numeric) else None
 
         for (key, result) in zip(tasks.keys(), results):
             if isinstance(result, Exception):

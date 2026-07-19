@@ -56,8 +56,26 @@
             "ap_air_quality": {
                 "name": "AP Air Quality"
             },
+            "ap_air_quality_tvoc": {
+                "name": "AP TVOC"
+            },
+            "ap_air_quality_etoh": {
+                "name": "AP EtOH"
+            },
             "ap_clients": {
                 "name": "AP Clients"
+            },
+            "ap_clients_24ghz": {
+                "name": "AP Clients 2.4 GHz"
+            },
+            "ap_clients_5ghz": {
+                "name": "AP Clients 5 GHz"
+            },
+            "ap_clients_6ghz": {
+                "name": "AP Clients 6 GHz"
+            },
+            "ap_status": {
+                "name": "AP Status"
             },
             "ap_radio_channel": {
                 "name": "AP Radio Channel"

@@ -7,11 +7,17 @@ This custom integration brings Cisco 9800 Wireless LAN Controller data into Home
 - **Client presence tracking** – Every connected client is exposed as a `device_tracker` entity with enrichment for device name, OS, RSSI, and optional deep polling per MAC.
 - **Controller status sensors** – Diagnostic binary sensor for controller availability plus a software-version sensor that survives restarts.
 - **Access point metadata** – Each AP appears as a device with aggregated client counts (total / 2.4 / 5 / 6 GHz), radio details, and automatic “last seen” timestamps.
-- **Environmental telemetry** – Temperature, humidity, and air-quality values are normalised per AP and merged into the device sensors.
+- **Environmental telemetry** – Temperature, humidity, IAQ, and TVOC sensors are normalised per AP, with EtOH as a disabled-by-default diagnostic sensor and RMOX values exposed as AP Air Quality attributes when reported.
 - **CDP/LLDP insights** – AP entities include attributes describing wired neighbours (device ID, port, platform, management address) for quick topology checks.
 - **LED control** – Per-AP buttons trigger LED on/off commands and start/stop flashing (60 s default) via the controller’s RESTCONF RPCs.
 - **Options UI** – Users can adjust scan cadence, AP detail refresh cadence, and choose clients for deep polling directly from the config entry options.
 - **Diagnostics bundle** – Downloadable diagnostics report the current options, cached AP/client state (sanitised), and latest controller responses to assist troubleshooting.
+
+## AP Air-Quality Values
+- **IAQ** is Cisco's processed indoor-air-quality value from the AP environmental sensor data. Lower values appear to represent better air quality, but Cisco does not publicly document RESTCONF category boundaries.
+- **TVOC** is Cisco's processed total volatile organic compounds value. Cisco Spaces can display TVOC in ppb or micrograms per cubic meter; this integration presents the Catalyst 9800 RESTCONF value as milligrams per cubic meter based on observed AP scale and Cisco Spaces' recommended level.
+- **EtOH** is an ethanol/alcohol-like volatile compound output included in WLC operational data. It is exposed as a disabled-by-default diagnostic sensor because Cisco Spaces does not normally present it as a user-facing environmental metric.
+- **RMOX 0-12** are raw metal-oxide gas-sensor values used as air-quality processing inputs. They are exposed as attributes on the AP Air Quality sensor, not standalone entities. They are diagnostic values, not separate named pollutants, and Cisco does not document individual gas meanings, thresholds, or health interpretations.
 
 ## Installation
 

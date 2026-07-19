@@ -17,6 +17,8 @@ from custom_components.cisco_9800_wlc.coordinator import CiscoWLCUpdateCoordinat
 from custom_components.cisco_9800_wlc.const import DOMAIN
 
 FIXTURE_DIR = Path(__file__).parents[2] / "fixtures" / "cisco_9800_wlc"
+AP_MAC = "34:5d:a8:0a:2e:40"
+AIR_QUALITY_LAST_UPDATE = "2026-07-19T09:12:49.248687+00:00"
 
 
 def load_fixture(name: str) -> dict:
@@ -26,6 +28,54 @@ def load_fixture(name: str) -> dict:
     if not path.exists():
         pytest.skip(f"Local Cisco WLC fixture is not present: {path}")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _temperature_payload(entries: list[dict] | None = None) -> dict:
+    return {
+        "Cisco-IOS-XE-wireless-access-point-oper:ap-temp": entries or []
+    }
+
+
+def _air_quality_payload(entries: list[dict] | None = None) -> dict:
+    return {
+        "Cisco-IOS-XE-wireless-access-point-oper:ap-air-quality": entries or []
+    }
+
+
+def _air_quality_entry(**values) -> dict:
+    return {
+        "ap-mac": AP_MAC,
+        "last-update": AIR_QUALITY_LAST_UPDATE,
+        **values,
+    }
+
+
+async def _fetch_air_quality(
+    hass: HomeAssistant,
+    coordinator_config: dict,
+    entries: list[dict] | None,
+) -> dict[str, dict]:
+    with patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_get_clientsession",
+        return_value=MockSession([]),
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.CiscoWLCUpdateCoordinator._start_enrich_worker",
+        return_value=None,
+    ):
+        coordinator = CiscoWLCUpdateCoordinator(
+            hass,
+            coordinator_config,
+            "entry_air_quality",
+        )
+
+    coordinator._get = AsyncMock(
+        side_effect=[
+            (200, _temperature_payload(), None),
+            (200, _air_quality_payload(entries), None),
+        ]
+    )
+
+    return await coordinator._async_fetch_ap_environment()
 
 
 class MockClientResponse:
@@ -258,6 +308,157 @@ async def test_ap_environment_uses_realistic_fixture_payloads(
             assert isinstance(sensor_data["iaq"], float)
         if "tvoc" in sensor_data:
             assert isinstance(sensor_data["tvoc"], float)
+
+
+@pytest.mark.asyncio
+async def test_ap_air_quality_full_payload_keeps_all_values(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Ensure full AP air-quality payloads parse every supported numeric field."""
+
+    payload = _air_quality_entry(
+        iaq="2.24",
+        tvoc="0.41",
+        etoh="0.22",
+        **{f"rmox-{index}": str(float(index + 1)) for index in range(13)},
+    )
+
+    sensors = await _fetch_air_quality(hass, coordinator_config, [payload])
+    sensor_data = sensors[AP_MAC]
+
+    assert sensor_data["iaq"] == 2.24
+    assert sensor_data["tvoc"] == 0.41
+    assert sensor_data["etoh"] == 0.22
+    for index in range(13):
+        assert sensor_data[f"rmox-{index}"] == float(index + 1)
+    assert sensor_data["air_quality_last_update"] == AIR_QUALITY_LAST_UPDATE
+
+
+@pytest.mark.asyncio
+async def test_ap_air_quality_partial_iaq_without_tvoc(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Ensure IAQ-only air-quality payloads do not invent missing values."""
+
+    sensors = await _fetch_air_quality(
+        hass,
+        coordinator_config,
+        [_air_quality_entry(iaq="1.25")],
+    )
+
+    sensor_data = sensors[AP_MAC]
+    assert sensor_data["iaq"] == 1.25
+    assert "tvoc" not in sensor_data
+    assert "etoh" not in sensor_data
+
+
+@pytest.mark.asyncio
+async def test_ap_air_quality_partial_tvoc_without_etoh(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Ensure TVOC-only air-quality payloads do not require EtOH."""
+
+    sensors = await _fetch_air_quality(
+        hass,
+        coordinator_config,
+        [_air_quality_entry(tvoc="0.41")],
+    )
+
+    sensor_data = sensors[AP_MAC]
+    assert sensor_data["tvoc"] == 0.41
+    assert "iaq" not in sensor_data
+    assert "etoh" not in sensor_data
+
+
+@pytest.mark.asyncio
+async def test_ap_air_quality_numeric_zero_remains_valid(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Ensure zero strings are parsed as real zero values, not missing data."""
+
+    sensors = await _fetch_air_quality(
+        hass,
+        coordinator_config,
+        [
+            _air_quality_entry(
+                iaq="0",
+                tvoc="0.0",
+                etoh=0,
+                **{f"rmox-{index}": "0" for index in range(13)},
+            )
+        ],
+    )
+
+    sensor_data = sensors[AP_MAC]
+    assert sensor_data["iaq"] == 0.0
+    assert sensor_data["tvoc"] == 0.0
+    assert sensor_data["etoh"] == 0.0
+    for index in range(13):
+        assert sensor_data[f"rmox-{index}"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_ap_air_quality_decimal_strings_convert_to_float(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Ensure decimal strings are safely converted to floats."""
+
+    sensors = await _fetch_air_quality(
+        hass,
+        coordinator_config,
+        [
+            _air_quality_entry(
+                iaq="3.64",
+                tvoc="1.98",
+                etoh="1.05",
+                **{"rmox-4": "1108295.13"},
+            )
+        ],
+    )
+
+    sensor_data = sensors[AP_MAC]
+    assert sensor_data["iaq"] == 3.64
+    assert sensor_data["tvoc"] == 1.98
+    assert sensor_data["etoh"] == 1.05
+    assert sensor_data["rmox-4"] == 1108295.13
+
+
+@pytest.mark.asyncio
+async def test_ap_air_quality_invalid_numeric_strings_are_missing(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Ensure invalid numeric values are omitted instead of coerced to zero."""
+
+    sensors = await _fetch_air_quality(
+        hass,
+        coordinator_config,
+        [
+            _air_quality_entry(
+                iaq="",
+                tvoc="not-a-number",
+                etoh="NaN",
+                **{
+                    "rmox-0": "inf",
+                    "rmox-1": " ",
+                },
+            )
+        ],
+    )
+
+    sensor_data = sensors[AP_MAC]
+    for key in ("iaq", "tvoc", "etoh", "rmox-0", "rmox-1"):
+        assert key not in sensor_data
+
+
+@pytest.mark.asyncio
+async def test_ap_without_air_quality_record_has_no_air_quality_data(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Ensure absent AP air-quality records do not create sensor records."""
+
+    sensors = await _fetch_air_quality(hass, coordinator_config, [])
+
+    assert sensors == {}
 
 
 @pytest.mark.asyncio

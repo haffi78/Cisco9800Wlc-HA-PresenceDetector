@@ -56,6 +56,12 @@
             "ap_air_quality": {
                 "name": "Loftgæðastuðull"
             },
+            "ap_air_quality_tvoc": {
+                "name": "TVOC"
+            },
+            "ap_air_quality_etoh": {
+                "name": "EtOH"
+            },
             "ap_clients": {
                 "name": "Heildarfjöldi tengdra viðskiptavina"
             },

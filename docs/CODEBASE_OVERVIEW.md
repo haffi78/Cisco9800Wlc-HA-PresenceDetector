@@ -350,9 +350,27 @@ Environmental values include:
 - Humidity.
 - IAQ.
 - TVOC.
-- ETOH.
+- EtOH.
 - RMOX values.
 - Last update timestamps.
+
+Air-quality interpretation:
+
+- `iaq` is Cisco's processed indoor-air-quality value. Lower values appear to
+  represent better air quality, but Cisco does not publicly document RESTCONF
+  category boundaries.
+- `tvoc` is Cisco's processed total volatile organic compounds value. Cisco
+  Spaces can display TVOC in ppb or micrograms per cubic meter. The integration
+  presents the Catalyst 9800 RESTCONF value as milligrams per cubic meter based
+  on observed AP scale and Cisco Spaces' recommended level.
+- `etoh` is an ethanol/alcohol-like volatile compound output in WLC operational
+  data. It is exposed as a disabled-by-default diagnostic entity because Cisco
+  Spaces does not normally show it as a user-facing environmental metric.
+- `rmox-0` through `rmox-12` are raw metal-oxide gas-sensor values used as
+  air-quality processing inputs. They are exposed as AP Air Quality attributes,
+  not standalone entities. They are diagnostic values, not separate named
+  pollutants, and Cisco does not document individual gas meanings, thresholds,
+  or health interpretations.
 
 `_async_update_ap_devices()` controls when AP metadata is refreshed. It uses
 `ap_detail_interval` to avoid expensive metadata polling every client scan, then
@@ -384,6 +402,12 @@ AP sensors include:
 - Temperature.
 - Humidity.
 - Air quality index.
+- TVOC.
+- EtOH.
+
+The AP Air Quality sensor also exposes `tvoc`, `etoh`, and `rmox-0` through
+`rmox-12` as attributes when the AP reports them. The `RMOX` fields deliberately
+do not create standalone Home Assistant entities.
 
 AP numeric sensors only return native `int` or `float` values. This is deliberate
 so Home Assistant statistics and display precision behave correctly.

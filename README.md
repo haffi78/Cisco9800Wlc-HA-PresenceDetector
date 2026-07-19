@@ -1,5 +1,5 @@
 # Cisco 9800 WLC Home Assistant Integration
-Supported and tested all 9800 Versions post 17.12 to 17.18.2 so far.
+Supported and tested all 9800 Versions post 17.12 to 17.18.3 so far.
 ipv6 is partial supported, not fully tested all features .
 
 ## Overview

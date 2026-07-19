@@ -51,14 +51,12 @@ async def test_form_success(hass: HomeAssistant, mock_session: AsyncMock) -> Non
                 CONF_USERNAME: "admin",
                 CONF_PASSWORD: "secret",
                 CONF_IGNORE_SSL: True,
-                "enable_new_entities": True,
             },
         )
 
     assert result2["type"] is FlowResultType.CREATE_ENTRY
     assert result2["title"] == "wlc.example.com"
     assert result2["data"][CONF_HOST] == "wlc.example.com"
-    assert result2["options"]["enable_new_entities"] is True
     assert result2["options"][CONF_DETAILED_MACS] == []
 
 
@@ -74,7 +72,6 @@ async def test_reauth_flow(hass: HomeAssistant, mock_session: AsyncMock) -> None
             CONF_IGNORE_SSL: False,
         },
         options={
-            "enable_new_entities": False,
             CONF_DETAILED_MACS: [],
         },
         unique_id="wlc.example.com",

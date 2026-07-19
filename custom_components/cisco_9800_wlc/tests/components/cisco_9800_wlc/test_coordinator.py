@@ -11,10 +11,18 @@ import pytest
 
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import UpdateFailed
+from tests.common import MockConfigEntry
 
-from custom_components.cisco_9800_wlc.coordinator import CiscoWLCUpdateCoordinator
-from custom_components.cisco_9800_wlc.const import DOMAIN
+from custom_components.cisco_9800_wlc.coordinator import (
+    INITIAL_ENRICH_DELAY_SECONDS,
+    CiscoWLCUpdateCoordinator,
+    _has_client_detail,
+    _has_client_name,
+    _is_meaningful,
+)
+from custom_components.cisco_9800_wlc.const import CONF_DETAILED_MACS, DOMAIN
 
 FIXTURE_DIR = Path(__file__).parents[2] / "fixtures" / "cisco_9800_wlc"
 AP_MAC = "34:5d:a8:0a:2e:40"
@@ -34,6 +42,91 @@ def _temperature_payload(entries: list[dict] | None = None) -> dict:
     return {
         "Cisco-IOS-XE-wireless-access-point-oper:ap-temp": entries or []
     }
+
+
+def test_cached_client_detail_detection() -> None:
+    """Only meaningful enriched fields should mark cached clients as enriched."""
+
+    assert _has_client_detail({"IP Address": "192.0.2.10"}) is False
+    assert _has_client_detail({"device-name": "Kitchen iPhone"}) is True
+    assert _is_meaningful("Unknown Device") is False
+    assert _is_meaningful("Un-Classified Device") is True
+    assert _has_client_detail({"device-name": "Unknown Device", "ssid": ""}) is False
+    assert _has_client_detail({"device-name": "unknown", "ssid": ""}) is False
+    assert _has_client_detail({"ssid": "Home"}) is True
+
+
+def test_any_non_placeholder_device_name_is_real_client_name() -> None:
+    """Only Cisco's explicit name placeholders should keep identity refreshes open."""
+
+    assert _has_client_name({"device-name": "APPLE, INC."}) is True
+    assert _has_client_name({"device-name": "Un-Classified Device"}) is True
+    assert _has_client_name({"device-name": "Unknown"}) is False
+    assert _has_client_name({"device-name": "Unknown Device"}) is False
+    assert _has_client_name({"device-name": "blackey-iphone"}) is True
+
+
+def test_identity_placeholder_observations_stop_after_initial_plus_five_retries(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Repeated Cisco Unknown Device names should stop identity retries."""
+
+    mac = "94:89:78:89:36:11"
+    with patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_get_clientsession",
+        return_value=MockSession([]),
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.CiscoWLCUpdateCoordinator._start_enrich_worker",
+        return_value=None,
+    ):
+        coordinator = CiscoWLCUpdateCoordinator(
+            hass,
+            coordinator_config,
+            "entry_identity_observations",
+        )
+
+    for _ in range(5):
+        coordinator._record_identity_name_observation(mac, "Unknown Device")
+    assert mac not in coordinator._identity_enrich_exhausted
+
+    coordinator._record_identity_name_observation(mac, "Unknown Device")
+
+    assert mac in coordinator._identity_enrich_exhausted
+
+
+def test_identity_non_placeholder_name_observation_clears_retries(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Any non-placeholder Cisco device-name should be treated as final."""
+
+    mac = "80:b9:89:7b:62:2d"
+    with patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_get_clientsession",
+        return_value=MockSession([]),
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.CiscoWLCUpdateCoordinator._start_enrich_worker",
+        return_value=None,
+    ):
+        coordinator = CiscoWLCUpdateCoordinator(
+            hass,
+            coordinator_config,
+            "entry_identity_vendor_observations",
+        )
+
+    coordinator._identity_enrich_exhausted.add(mac)
+    coordinator._identity_name_observations[mac] = [True, True]
+
+    coordinator._record_identity_name_observation(
+        mac,
+        {
+            "device-name": "APPLE, INC.",
+            "device-os": "iPhone16,2",
+            "day-zero-dc": "APPLE, INC.",
+        },
+    )
+
+    assert mac not in coordinator._identity_enrich_exhausted
+    assert mac not in coordinator._identity_name_observations
 
 
 def _air_quality_payload(entries: list[dict] | None = None) -> dict:
@@ -166,6 +259,220 @@ async def test_coordinator_refresh_discovers_new_client(
     assert args[0] == hass
     assert args[1] == "cisco_9800_wlc_new_clients"
     assert "aa:bb:cc:dd:ee:ff" in args[3]
+
+
+@pytest.mark.asyncio
+async def test_enabled_tracker_does_not_trigger_recurring_detail_without_manual_selection(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Enabled presence trackers should not imply recurring detailed polling."""
+
+    mac = "aa:bb:cc:dd:ee:ff"
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        entry_id="entry_presence_only",
+        data=coordinator_config,
+        options={},
+        unique_id="wlc.example.com",
+    )
+    entry.add_to_hass(hass)
+    er.async_get(hass).async_get_or_create(
+        "device_tracker",
+        DOMAIN,
+        f"wlc.example.com_{mac}",
+        suggested_object_id="client_presence_only",
+        config_entry=entry,
+    )
+
+    response_payload = {
+        "Cisco-IOS-XE-wireless-client-oper:sisf-db-mac": [
+            {"mac-addr": mac}
+        ]
+    }
+    mock_fetch = AsyncMock(return_value={"device-name": "Should Not Fetch"})
+
+    with patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_get_clientsession",
+        return_value=MockSession([MockClientResponse(200, response_payload)]),
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.CiscoWLCUpdateCoordinator._start_enrich_worker",
+        return_value=None,
+    ), patch.object(
+        CiscoWLCUpdateCoordinator,
+        "_async_fetch_ap_environment",
+        new=AsyncMock(return_value={}),
+    ), patch.object(
+        CiscoWLCUpdateCoordinator,
+        "_async_update_ap_devices",
+        new=AsyncMock(return_value=None),
+    ), patch.object(
+        CiscoWLCUpdateCoordinator,
+        "_schedule_enrich_with_delay",
+    ) as mock_schedule, patch.object(
+        CiscoWLCUpdateCoordinator,
+        "fetch_attributes",
+        mock_fetch,
+    ):
+        coordinator = CiscoWLCUpdateCoordinator(
+            hass,
+            coordinator_config,
+            entry.entry_id,
+            options={},
+        )
+        coordinator._last_version_fetch = datetime.now()
+        data = await coordinator._async_update_data()
+
+    mock_fetch.assert_not_called()
+    mock_schedule.assert_called_once_with({mac}, INITIAL_ENRICH_DELAY_SECONDS)
+    assert data[mac]["connected"] is True
+
+
+@pytest.mark.asyncio
+async def test_manual_detailed_selection_triggers_detail_polling(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Only MACs selected in detailed_macs should receive detailed polling."""
+
+    mac = "aa:bb:cc:dd:ee:ff"
+    response_payload = {
+        "Cisco-IOS-XE-wireless-client-oper:sisf-db-mac": [
+            {"mac-addr": mac}
+        ]
+    }
+    mock_fetch = AsyncMock(return_value={"device-name": "Phone"})
+
+    with patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_get_clientsession",
+        return_value=MockSession([MockClientResponse(200, response_payload)]),
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.CiscoWLCUpdateCoordinator._start_enrich_worker",
+        return_value=None,
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_dispatcher_send"
+    ), patch.object(
+        CiscoWLCUpdateCoordinator,
+        "_async_fetch_ap_environment",
+        new=AsyncMock(return_value={}),
+    ), patch.object(
+        CiscoWLCUpdateCoordinator,
+        "_async_update_ap_devices",
+        new=AsyncMock(return_value=None),
+    ), patch.object(
+        CiscoWLCUpdateCoordinator,
+        "fetch_attributes",
+        mock_fetch,
+    ):
+        coordinator = CiscoWLCUpdateCoordinator(
+            hass,
+            coordinator_config,
+            "entry_detailed",
+            options={CONF_DETAILED_MACS: [mac]},
+        )
+        coordinator._last_version_fetch = datetime.now()
+        data = await coordinator._async_update_data()
+
+    mock_fetch.assert_called_once_with(mac)
+    assert data[mac]["device-name"] == "Phone"
+
+
+@pytest.mark.asyncio
+async def test_new_unselected_client_schedules_one_shot_enrichment_for_name(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Unselected clients should get one-shot enrichment for naming."""
+
+    mac = "aa:bb:cc:dd:ee:ff"
+    response_payload = {
+        "Cisco-IOS-XE-wireless-client-oper:sisf-db-mac": [
+            {"mac-addr": mac}
+        ]
+    }
+
+    with patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_get_clientsession",
+        return_value=MockSession([MockClientResponse(200, response_payload)]),
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.CiscoWLCUpdateCoordinator._start_enrich_worker",
+        return_value=None,
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_dispatcher_send"
+    ), patch.object(
+        CiscoWLCUpdateCoordinator,
+        "_schedule_enrich_with_delay",
+    ) as mock_schedule, patch.object(
+        CiscoWLCUpdateCoordinator,
+        "_async_fetch_ap_environment",
+        new=AsyncMock(return_value={}),
+    ), patch.object(
+        CiscoWLCUpdateCoordinator,
+        "_async_update_ap_devices",
+        new=AsyncMock(return_value=None),
+    ):
+        coordinator = CiscoWLCUpdateCoordinator(
+            hass,
+            coordinator_config,
+            "entry_presence_new",
+            options={CONF_DETAILED_MACS: []},
+        )
+        coordinator._last_version_fetch = datetime.now()
+        data = await coordinator._async_update_data()
+
+    mock_schedule.assert_called_once_with({mac}, INITIAL_ENRICH_DELAY_SECONDS)
+    assert data[mac]["connected"] is True
+
+
+@pytest.mark.asyncio
+async def test_placeholder_client_name_schedules_one_shot_refresh(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Cached placeholder names should be refreshed without recurring detail polling."""
+
+    mac = "94:89:78:89:36:11"
+    response_payload = {
+        "Cisco-IOS-XE-wireless-client-oper:sisf-db-mac": [
+            {"mac-addr": mac}
+        ]
+    }
+
+    with patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_get_clientsession",
+        return_value=MockSession([MockClientResponse(200, response_payload)]),
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.CiscoWLCUpdateCoordinator._start_enrich_worker",
+        return_value=None,
+    ), patch.object(
+        CiscoWLCUpdateCoordinator,
+        "_schedule_enrich_with_delay",
+    ) as mock_schedule, patch.object(
+        CiscoWLCUpdateCoordinator,
+        "_async_fetch_ap_environment",
+        new=AsyncMock(return_value={}),
+    ), patch.object(
+        CiscoWLCUpdateCoordinator,
+        "_async_update_ap_devices",
+        new=AsyncMock(return_value=None),
+    ):
+        coordinator = CiscoWLCUpdateCoordinator(
+            hass,
+            coordinator_config,
+            "entry_placeholder_name",
+            options={CONF_DETAILED_MACS: []},
+        )
+        coordinator.data = {
+            mac: {
+                "device-name": "Unknown Device",
+                "ssid": "Home",
+            }
+        }
+        coordinator._initial_enriched.add(mac)
+        coordinator._announced_new_clients.add(mac)
+        coordinator._last_version_fetch = datetime.now()
+
+        data = await coordinator._async_update_data()
+
+    mock_schedule.assert_called_once_with({mac}, INITIAL_ENRICH_DELAY_SECONDS)
+    assert data[mac]["device-name"] == "Unknown Device"
+    assert data[mac]["connected"] is True
 
 
 def test_client_connection_attributes_prefers_non_link_local_ipv6(
@@ -552,3 +859,189 @@ async def test_client_detail_uses_local_fixture_payloads(
 
     assert isinstance(attributes, dict)
     assert coordinator._get.call_count >= 5
+
+
+@pytest.mark.asyncio
+async def test_client_detail_keeps_six_previous_roams(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Roaming history should expose most recent plus six previous roams."""
+
+    roaming_entries = [
+        {
+            "ap-name": f"AP-{index}",
+            "ms-assoc-time": f"2026-04-25T12:{7 - index:02d}:00+00:00",
+        }
+        for index in range(8)
+    ]
+    fixtures = [
+        {"Cisco-IOS-XE-wireless-client-oper:common-oper-data": [{"ap-name": "AP-0"}]},
+        {
+            "Cisco-IOS-XE-wireless-client-oper:dot11-oper-data": [
+                {"current-channel": 6, "vap-ssid": "Home"}
+            ]
+        },
+        {"Cisco-IOS-XE-wireless-client-oper:speed": 100},
+        {
+            "Cisco-IOS-XE-wireless-client-oper:mobility-history": {
+                "entry": roaming_entries
+            }
+        },
+        {"Cisco-IOS-XE-wireless-client-oper:dc-info": [{"device-name": "Phone"}]},
+    ]
+
+    with patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_get_clientsession",
+        return_value=MockSession([]),
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.CiscoWLCUpdateCoordinator._start_enrich_worker",
+        return_value=None,
+    ):
+        coordinator = CiscoWLCUpdateCoordinator(hass, coordinator_config, "entry_roams")
+
+    coordinator._get = AsyncMock(
+        side_effect=[(200, fixture, None) for fixture in fixtures]
+    )
+
+    attributes = await coordinator.fetch_attributes("aa:bb:cc:dd:ee:ff")
+
+    assert attributes["most_recent_roam"].startswith("AP-0 at ")
+    assert attributes["previous_roam_1"].startswith("AP-1 at ")
+    assert attributes["previous_roam_6"].startswith("AP-6 at ")
+    assert "previous_roam_7" not in attributes
+    assert len(attributes["roaming_history"]) == 7
+    assert attributes["roaming_history"][0].startswith("AP-0 at ")
+    assert attributes["roaming_history"][6].startswith("AP-6 at ")
+
+
+@pytest.mark.asyncio
+async def test_fetch_attributes_refreshes_placeholder_device_name(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """A cached Unknown Device name should not suppress dc-info refreshes."""
+
+    mac = "94:89:78:89:36:11"
+    fixtures = [
+        {"Cisco-IOS-XE-wireless-client-oper:common-oper-data": [{"ap-name": "AP-1"}]},
+        {
+            "Cisco-IOS-XE-wireless-client-oper:dot11-oper-data": [
+                {"current-channel": 11, "vap-ssid": "Home"}
+            ]
+        },
+        {"Cisco-IOS-XE-wireless-client-oper:speed": 100},
+        {
+            "Cisco-IOS-XE-wireless-client-oper:mobility-history": {
+                "entry": []
+            }
+        },
+        {
+            "Cisco-IOS-XE-wireless-client-oper:dc-info": [
+                {
+                    "device-name": "Kitchen Tablet",
+                    "device-type": "Tablet",
+                    "device-os": "Android",
+                    "protocol-map": (
+                        "protocol-map-oui protocol-map-dhcp protocol-map-http"
+                    ),
+                    "confidence-level": 10,
+                    "classified-time": "2026-07-19T17:10:00+00:00",
+                    "day-zero-dc": "APPLE, INC.",
+                    "device-vendor": "Apple",
+                    "device-protocol": "DHCP",
+                    "device-sub-version": "26.5",
+                }
+            ]
+        },
+    ]
+
+    with patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_get_clientsession",
+        return_value=MockSession([]),
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.CiscoWLCUpdateCoordinator._start_enrich_worker",
+        return_value=None,
+    ):
+        coordinator = CiscoWLCUpdateCoordinator(hass, coordinator_config, "entry_name")
+
+    coordinator.data = {
+        mac: {
+            "device-name": "Unknown Device",
+            "device-type": "Tablet",
+            "device-os": "Android",
+        }
+    }
+    coordinator._get = AsyncMock(
+        side_effect=[(200, fixture, None) for fixture in fixtures]
+    )
+
+    attributes = await coordinator.fetch_attributes(mac)
+
+    assert attributes["device-name"] == "Kitchen Tablet"
+    assert (
+        attributes["protocol-map"]
+        == "protocol-map-oui protocol-map-dhcp protocol-map-http"
+    )
+    assert attributes["confidence-level"] == 10
+    assert attributes["classified-time"] == "2026-07-19T17:10:00+00:00"
+    assert attributes["day-zero-dc"] == "APPLE, INC."
+    assert attributes["device-vendor"] == "Apple"
+    assert attributes["device-protocol"] == "DHCP"
+    assert attributes["device-sub-version"] == "26.5"
+    assert coordinator.data[mac]["device-name"] == "Kitchen Tablet"
+    assert any("dc-info=" in call.args[0] for call in coordinator._get.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_fetch_attributes_keeps_non_placeholder_device_name_as_final(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Any cached non-placeholder device-name should suppress dc-info refreshes."""
+
+    mac = "80:b9:89:7b:62:2d"
+    fixtures = [
+        {"Cisco-IOS-XE-wireless-client-oper:common-oper-data": [{"ap-name": "AP-1"}]},
+        {
+            "Cisco-IOS-XE-wireless-client-oper:dot11-oper-data": [
+                {"current-channel": 11, "vap-ssid": "Home"}
+            ]
+        },
+        {"Cisco-IOS-XE-wireless-client-oper:speed": 100},
+        {
+            "Cisco-IOS-XE-wireless-client-oper:mobility-history": {
+                "entry": []
+            }
+        },
+    ]
+
+    with patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_get_clientsession",
+        return_value=MockSession([]),
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.CiscoWLCUpdateCoordinator._start_enrich_worker",
+        return_value=None,
+    ):
+        coordinator = CiscoWLCUpdateCoordinator(
+            hass,
+            coordinator_config,
+            "entry_vendor_name",
+        )
+
+    coordinator.data = {
+        mac: {
+            "device-name": "APPLE, INC.",
+            "device-type": "Apple-Device",
+            "device-os": "iPhone16,2",
+            "day-zero-dc": "APPLE, INC.",
+        }
+    }
+    coordinator._get = AsyncMock(
+        side_effect=[(200, fixture, None) for fixture in fixtures]
+    )
+
+    attributes = await coordinator.fetch_attributes(mac)
+
+    assert "device-name" not in attributes
+    assert coordinator.data[mac]["device-name"] == "APPLE, INC."
+    assert not any(
+        "dc-info=" in call.args[0] for call in coordinator._get.await_args_list
+    )

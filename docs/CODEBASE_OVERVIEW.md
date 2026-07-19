@@ -14,6 +14,8 @@ Assistant.
 The integration currently provides:
 
 - Device tracker entities for connected wireless or wired clients.
+- Client `Current AP` sensors for recorder-backed AP-name history when detailed
+  telemetry is available.
 - A controller connectivity binary sensor.
 - A controller software version diagnostic sensor.
 - AP status, AP client-count, AP radio, and AP environmental sensors.
@@ -27,6 +29,10 @@ The integration is configured in Home Assistant as `cisco_9800_wlc`.
 
 - `custom_components/cisco_9800_wlc/`
   Main Home Assistant integration package.
+
+- `custom_components/cisco_9800_wlc/brand/`
+  Local custom-integration brand images used by Home Assistant 2026.3 and newer.
+  `icon.png` and `logo.png` are served through Home Assistant's brands API.
 
 - `custom_components/cisco_9800_wlc/__init__.py`
   Entry setup and unload logic. Creates the coordinator, registers services,
@@ -43,8 +49,8 @@ The integration is configured in Home Assistant as `cisco_9800_wlc`.
   Client `device_tracker` entities.
 
 - `custom_components/cisco_9800_wlc/sensor.py`
-  Controller version sensor plus AP status, AP aggregate, AP radio, and AP
-  environmental sensors.
+  Controller version sensor, client Current AP sensor, plus AP status, AP
+  aggregate, AP radio, and AP environmental sensors.
 
 - `custom_components/cisco_9800_wlc/binary_sensor.py`
   Controller online/offline binary sensor.
@@ -122,11 +128,6 @@ entry per WLC host.
 
 The options flow controls:
 
-- `enable_new_entities`
-  Despite the current README wording, the code passes this value to
-  `entity_registry_enabled_default`. `True` means newly created client tracker
-  entities are enabled by default. `False` means they are disabled by default.
-
 - `scan_interval`
   Main client polling and AP environmental telemetry interval. The minimum is
   5 seconds.
@@ -137,10 +138,12 @@ The options flow controls:
   Default is 3600 seconds.
 
 - `detailed_macs`
-  A list of client MACs that should receive detailed per-cycle enrichment.
+  A list of client MACs that should receive recurring detailed per-cycle
+  enrichment.
 
-If `detailed_macs` is not explicitly set, enabled device tracker entities are
-used as the detailed enrichment target set.
+Client tracker entities are enabled for basic presence by default. Detailed
+per-cycle enrichment is controlled only by `detailed_macs`, so enabling a
+tracker in Home Assistant does not add recurring WLC per-client RESTCONF calls.
 
 ## Coordinator Responsibilities
 
@@ -212,8 +215,9 @@ entities dynamically.
 
 ## Client Detailed Enrichment
 
-Detailed client enrichment is optional and controlled by `detailed_macs` or by
-enabled tracker entities when the option is unset.
+Recurring detailed client enrichment is optional and controlled by
+`detailed_macs`. New or previously unseen clients still receive one-shot
+enrichment so Home Assistant can learn useful names and descriptive attributes.
 
 Detailed enrichment uses these RESTCONF endpoints:
 
@@ -235,7 +239,8 @@ The code extracts:
 - Wi-Fi standard.
 - Device name, type, and OS.
 - Connection speed.
-- Recent roaming history.
+- Recent roaming history: most recent roam plus up to six previous roams,
+  exposed both as individual attributes and as a compact `Roaming History` list.
 
 Enrichment avoids replacing useful old values with empty, unknown, or placeholder
 values. `_is_meaningful()` is the key helper for this behavior.
@@ -248,9 +253,18 @@ There are two enrichment paths:
 The one-shot enrichment worker has retries and mild throttling awareness. It is
 started by the coordinator and cancelled during unload.
 
+Detailed client AP names are also exposed through a `Current AP` string sensor.
+Because the normal client list does not include AP names, long-term AP history
+only updates continuously for clients selected in `detailed_macs`. The sensor
+does not initiate WLC calls; it records the latest detailed `ap-name` state and
+switches to `not_home` when the coordinator marks the client disconnected.
+
 ## Client Entity Model
 
 Client entities are implemented in `device_tracker.py` by `CiscoWLCClient`.
+The companion `Current AP` entity is implemented in `sensor.py` by
+`CiscoWLCClientCurrentAPSensor` so AP-name changes are stored as Home Assistant
+sensor state history instead of only as attributes.
 
 Important behavior:
 
@@ -590,10 +604,6 @@ When adding services:
 
 - Software version polling is intentionally not used as the only online/offline
   signal.
-
-- The README currently says "Disable newly discovered devices by default", but
-  the code option is named `enable_new_entities`. Check wording carefully when
-  changing the options UI.
 
 - `gh` is not required by the integration itself. It only matters for release
   automation from a developer workstation.

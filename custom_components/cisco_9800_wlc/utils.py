@@ -5,6 +5,36 @@ from ipaddress import ip_address
 from urllib.parse import quote
 
 CLIENT_UNIQUE_ID_SEPARATOR = "_"
+PLACEHOLDER_CLIENT_LABELS = {
+    "unknown",
+    "unknown device",
+}
+
+
+def meaningful_client_label(value: object) -> str | None:
+    """Return a user-facing client label unless it is a known placeholder."""
+
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate or candidate.lower() in PLACEHOLDER_CLIENT_LABELS:
+        return None
+    return candidate
+
+
+def real_client_name(attributes: object) -> str | None:
+    """Return Cisco's device-name unless it is one of its name placeholders."""
+
+    if not isinstance(attributes, dict):
+        return None
+
+    return meaningful_client_label(attributes.get("device-name"))
+
+
+def best_client_label(attributes: object) -> str | None:
+    """Return the real Cisco client name, if one is available."""
+
+    return real_client_name(attributes)
 
 
 def normalize_controller_identifier(host: str) -> str:

@@ -4,13 +4,14 @@
 This custom integration brings Cisco 9800 Wireless LAN Controller data into Home Assistant. It collects connected-client telemetry, access-point metadata, environmental sensor readings, and exposes controller actions such as toggling AP LEDs. The project follows Home Assistant’s bronze-quality checklist while continuing to add the documentation, diagnostics, and runtime handling expected of higher tiers.
 
 ## Features
-- **Client presence tracking** – Every connected client is exposed as a `device_tracker` entity with enrichment for device name, OS, RSSI, and optional deep polling per MAC.
+- **Client presence tracking** – Every connected client is exposed as a `device_tracker` entity with one-shot naming enrichment and optional recurring deep polling per selected MAC.
+- **Client AP history** – Selected detailed clients also get a `Current AP` sensor whose state is the AP name, allowing Home Assistant recorder/history to show where the client has roamed over time.
 - **Controller status sensors** – Diagnostic binary sensor for controller availability plus a software-version sensor that survives restarts.
 - **Access point metadata** – Each AP appears as a device with aggregated client counts (total / 2.4 / 5 / 6 GHz), radio details, and automatic “last seen” timestamps.
 - **Environmental telemetry** – Temperature, humidity, IAQ, and TVOC sensors are normalised per AP, with EtOH as a disabled-by-default diagnostic sensor and RMOX values exposed as AP Air Quality attributes when reported.
 - **CDP/LLDP insights** – AP entities include attributes describing wired neighbours (device ID, port, platform, management address) for quick topology checks.
 - **LED control** – Per-AP buttons trigger LED on/off commands and start/stop flashing (60 s default) via the controller’s RESTCONF RPCs.
-- **Options UI** – Users can adjust scan cadence, AP inventory/radio refresh cadence, and choose clients for deep polling directly from the config entry options.
+- **Options UI** – Users can adjust scan cadence, AP inventory/radio refresh cadence, and choose which clients receive recurring deep polling directly from the config entry options.
 - **Diagnostics bundle** – Downloadable diagnostics report the current options, cached AP/client state (sanitised), and latest controller responses to assist troubleshooting.
 
 ## AP Air-Quality Values
@@ -38,10 +39,9 @@ This custom integration brings Cisco 9800 Wireless LAN Controller data into Home
 ## Setup & Options
 - **Host / Credentials** – Required during setup. Changing them later triggers a re-authentication flow.
 - **Ignore Self-Signed SSL Certificates** – Skip TLS validation for lab controllers (avoid in production).
-- **Disable newly discovered devices by default** – When enabled, new client trackers remain disabled until you manually enable them in the entity registry.
 - **Scan interval (sec)** – Global client polling and AP environmental telemetry cadence, including temperature, humidity, IAQ, and TVOC (default 120 s, minimum 5 s).
 - **AP inventory/radio refresh interval (sec)** – How often AP identity, join state, radio details, client totals, and CDP/LLDP neighbour data are refreshed (default 3600 s, minimum 60 s).
-- **Check the detailed MAC addresses** – Multi-select of clients that should receive deep per-cycle polling; leave empty to rely on passive tracking.
+- **Check the detailed MAC addresses** – Multi-select of clients that should receive recurring deep polling; leave empty for presence tracking plus one-shot naming only. Current AP history only updates continuously for clients selected here.
 
 ## Entities & Services
 - **Devices:**
@@ -49,7 +49,9 @@ This custom integration brings Cisco 9800 Wireless LAN Controller data into Home
   - One device per AP containing:
     - Aggregate sensors (`Total Clients Connected`, band-specific client counts, environment metrics).
     - Buttons: `AP LED On`, `AP LED Off`, `AP LED Flash Start`, `AP LED Flash Stop`.
-- **Device trackers:** One per connected client (auto-created/disabled based on options).
+- **Device trackers:** One enabled presence tracker per discovered client, with one-shot enrichment for naming; selected clients also receive recurring detailed telemetry attributes.
+- **Client Current AP sensors:** One sensor per selected detailed client. Its state is the detailed `ap-name` value when available and `not_home` when the client drops offline, so Home Assistant can retain AP-name history through recorder. The sensor itself does not perform extra WLC calls.
+- **Client roaming history:** Detailed client attributes include the current AP plus most recent roam, six previous roams, and a compact `Roaming History` list.
 - **Services:**
   - `cisco_9800_wlc.set_ap_led_state` (`ap_mac`/`ap_name`, `enabled`, optional `entry_id`).
   - `cisco_9800_wlc.set_ap_led_flash` (`enabled`, optional `duration` seconds).

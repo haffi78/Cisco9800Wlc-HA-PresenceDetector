@@ -19,7 +19,12 @@ from .const import (
     CONF_AP_DETAIL_INTERVAL,
     DEFAULT_AP_DETAIL_INTERVAL,
 )
-from .utils import build_https_url, client_mac_from_unique_id
+from .utils import (
+    PLACEHOLDER_CLIENT_LABELS,
+    build_https_url,
+    client_mac_from_unique_id,
+    real_client_name,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -38,6 +43,11 @@ DEBUG_PAYLOAD_MAX_CHARS = 10000  # truncate long payloads in debug logs
 ENRICH_RETRY_LIMIT = 3
 ENRICH_DELAY_SECONDS = 0.8
 INITIAL_ENRICH_DELAY_SECONDS = 4.0
+IDENTITY_ENRICH_RETRY_LIMIT = 5
+# Name data can lag client association by minutes on the WLC.
+IDENTITY_ENRICH_RETRY_BASE_SECONDS = 120.0
+IDENTITY_ENRICH_RETRY_MAX_SECONDS = 600.0
+ROAM_HISTORY_LIMIT = 7  # Most recent roam plus six previous roams.
 CLIENT_ALWAYS_REPLACE_FIELDS = {
     "connected",
     "IP Address",
@@ -47,6 +57,33 @@ CLIENT_ALWAYS_REPLACE_FIELDS = {
     "Connected to Controller",
     "last_seen",
     "attributes_updated",
+}
+CLIENT_DETAIL_FIELDS = {
+    "ap-name",
+    "username",
+    "ssid",
+    "current-channel",
+    "auth-key-mgmt",
+    "speed",
+    "device-name",
+    "device-type",
+    "device-os",
+    "device-vendor",
+    "device-protocol",
+    "device-sub-version",
+    "protocol-map",
+    "confidence-level",
+    "classified-time",
+    "day-zero-dc",
+    "WifiStandard",
+    "most_recent_roam",
+    "previous_roam_1",
+    "previous_roam_2",
+    "previous_roam_3",
+    "previous_roam_4",
+    "previous_roam_5",
+    "previous_roam_6",
+    "roaming_history",
 }
 
 # Dispatcher signal name used to announce newly discovered clients (MACs)
@@ -132,9 +169,40 @@ def _is_meaningful(value) -> bool:
         if not s:
             return False
         lowered = s.lower()
-        if lowered in {"unknown", "n/a", "na"}:
+        if lowered in PLACEHOLDER_CLIENT_LABELS:
             return False
     return True
+
+
+def _is_placeholder_client_label(value: Any) -> bool:
+    """Return whether a value is a known client label placeholder."""
+
+    return (
+        isinstance(value, str)
+        and value.strip().lower() in PLACEHOLDER_CLIENT_LABELS
+    )
+
+
+def _has_client_name(attributes: Any) -> bool:
+    """Return whether cached client data has a real device name."""
+
+    return real_client_name(attributes) is not None
+
+
+def _has_client_detail(attributes: Any) -> bool:
+    """Return whether cached client data already contains enriched details."""
+
+    if not isinstance(attributes, dict):
+        return False
+    return any(_is_meaningful(attributes.get(field)) for field in CLIENT_DETAIL_FIELDS)
+
+
+def _needs_client_name_refresh(attributes: Any) -> bool:
+    """Return whether cached data still needs a real device-name."""
+
+    if not isinstance(attributes, dict):
+        return False
+    return real_client_name(attributes) is None
 
 
 def _debug_value(value: Any) -> str:
@@ -352,9 +420,12 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         self._cached_client_store: dict[str, dict[str, Any]] | None = None
         self._initial_enriched: set[str] = set()
         self._enrich_pending: set[str] = set()
+        self._enrich_scheduled: set[str] = set()
         self._enrich_attempts: dict[str, int] = {}
         self._enrich_queue: asyncio.Queue[str] = asyncio.Queue()
         self._enrich_worker_task: asyncio.Task | None = None
+        self._identity_enrich_exhausted: set[str] = set()
+        self._identity_name_observations: dict[str, list[bool]] = {}
         # Version fetch cadence control
         self._last_version_fetch: datetime | None = None
         self._version_fetch_interval = timedelta(minutes=10)
@@ -456,7 +527,9 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     self.data = {}
                 self.data.update(data)
                 cached_macs = {
-                    mac for mac in data.keys() if isinstance(mac, str)
+                    mac
+                    for mac, attributes in data.items()
+                    if isinstance(mac, str) and _has_client_detail(attributes)
                 }
                 self._initial_enriched = set(cached_macs)
             else:
@@ -514,18 +587,54 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         while True:
             mac = await self._enrich_queue.get()
             retry = False
+            retry_delay: float | None = None
             status_hint = 'ok'
             try:
                 await asyncio.sleep(ENRICH_DELAY_SECONDS)
                 _LOGGER.debug("One-shot enrich started for %s", mac)
                 result = await self.fetch_attributes(mac)
                 if result:
-                    self._enrich_attempts.pop(mac, None)
                     status_hint = self._last_enrich_status.get(mac, 'ok')
                     # Push updated data so entities get attributes sooner
                     self.async_set_updated_data(self.data)
                     await self._async_update_client_snapshot(mac)
-                    _LOGGER.debug("One-shot enrich completed for %s", mac)
+                    if _has_client_name(self.data.get(mac, {})):
+                        self._enrich_attempts.pop(mac, None)
+                        self._identity_enrich_exhausted.discard(mac)
+                        _LOGGER.debug("One-shot enrich completed for %s", mac)
+                    else:
+                        attempts = self._enrich_attempts.get(mac, 0) + 1
+                        self._enrich_attempts[mac] = attempts
+                        if mac in self._identity_enrich_exhausted:
+                            _LOGGER.debug(
+                                "One-shot enrich for %s returned a placeholder "
+                                "device name often enough to stop retries",
+                                mac,
+                            )
+                            self._enrich_attempts.pop(mac, None)
+                        elif attempts <= IDENTITY_ENRICH_RETRY_LIMIT:
+                            _LOGGER.debug(
+                                "One-shot enrich for %s returned details but no device name "
+                                "(attempt %d/%d); retrying",
+                                mac,
+                                attempts,
+                                IDENTITY_ENRICH_RETRY_LIMIT,
+                            )
+                            retry = True
+                            retry_delay = min(
+                                IDENTITY_ENRICH_RETRY_MAX_SECONDS,
+                                IDENTITY_ENRICH_RETRY_BASE_SECONDS
+                                * (2 ** (attempts - 1)),
+                            )
+                        else:
+                            _LOGGER.warning(
+                                "One-shot enrich for %s did not learn a device name "
+                                "after %d attempts",
+                                mac,
+                                attempts,
+                            )
+                            self._identity_enrich_exhausted.add(mac)
+                            self._enrich_attempts.pop(mac, None)
                 else:
                     attempts = self._enrich_attempts.get(mac, 0) + 1
                     self._enrich_attempts[mac] = attempts
@@ -535,6 +644,8 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                         retry = True
                     else:
                         _LOGGER.warning("One-shot enrich for %s did not return detailed data after %d attempts", mac, attempts)
+                        if not _has_client_name(self.data.get(mac, {})):
+                            self._identity_enrich_exhausted.add(mac)
                         self._enrich_attempts.pop(mac, None)
             except ConfigEntryAuthFailed:
                 self._enrich_pending.discard(mac)
@@ -555,17 +666,16 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 self._enrich_queue.task_done()
                 if retry:
                     attempts = max(1, self._enrich_attempts.get(mac, 1))
-                    delay = min(5.0, ENRICH_DELAY_SECONDS * attempts)
-                    if status_hint == 'throttled':
+                    delay = retry_delay or min(5.0, ENRICH_DELAY_SECONDS * attempts)
+                    if retry_delay is None and status_hint == 'throttled':
                         delay = min(10.0, max(delay, ENRICH_DELAY_SECONDS * (attempts + 2)))
-                    await asyncio.sleep(delay)
-                    await self.async_enqueue_enrich({mac})
+                    self._schedule_enrich_with_delay({mac}, delay)
 
     async def async_enqueue_enrich(self, macs: set[str]) -> None:
         if macs:
             _LOGGER.debug("Queueing %d MAC(s) for one-shot enrichment: %s", len(macs), ", ".join(sorted(macs)))
         for mac in sorted(macs):
-            if mac in self._enrich_pending:
+            if mac in self._enrich_pending or mac in self._enrich_scheduled:
                 continue
             self._enrich_pending.add(mac)
             self._enrich_attempts.setdefault(mac, 0)
@@ -575,13 +685,55 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         if not macs:
             return
 
-        macs_to_queue = set(macs)
+        macs_to_queue = {
+            mac
+            for mac in macs
+            if mac not in self._enrich_pending and mac not in self._enrich_scheduled
+        }
+        if not macs_to_queue:
+            return
+
+        self._enrich_scheduled.update(macs_to_queue)
 
         async def _delayed_enqueue():
             await asyncio.sleep(delay)
+            self._enrich_scheduled.difference_update(macs_to_queue)
             await self.async_enqueue_enrich(macs_to_queue)
 
         self.hass.loop.create_task(_delayed_enqueue())
+
+    def _record_identity_name_observation(self, mac: str, value: Any) -> None:
+        """Track whether Cisco repeatedly reports a placeholder device name."""
+
+        device_name = value.get("device-name") if isinstance(value, dict) else value
+        if real_client_name(value) or (
+            not isinstance(value, dict)
+            and _is_meaningful(device_name)
+            and not _is_placeholder_client_label(device_name)
+        ):
+            self._identity_name_observations.pop(mac, None)
+            self._identity_enrich_exhausted.discard(mac)
+            return
+
+        if not (
+            _is_placeholder_client_label(device_name)
+            or _is_meaningful(device_name)
+        ):
+            return
+
+        observations = self._identity_name_observations.setdefault(mac, [])
+        observations.append(True)
+        del observations[:-5]
+        if sum(observations) >= IDENTITY_ENRICH_RETRY_LIMIT + 1:
+            self._identity_enrich_exhausted.add(mac)
+            self._enrich_attempts.pop(mac, None)
+            _LOGGER.debug(
+                "Stopping identity retries for %s after Cisco reported a "
+                "placeholder device name %d time(s) in the last %d check(s)",
+                mac,
+                sum(observations),
+                len(observations),
+            )
 
     def get_detailed_macs(self) -> tuple[set[str], bool]:
         """Return MACs configured for detailed polling and whether the option was set explicitly."""
@@ -863,9 +1015,9 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 if not raw_mac:
                     continue
                 normalized_mac = self._normalize_mac(raw_mac) or raw_mac
-                active_macs_raw.add(raw_mac)
+                active_macs_raw.add(normalized_mac)
                 active_macs_normalized.add(normalized_mac)
-                normalized_to_raw.setdefault(normalized_mac, raw_mac)
+                normalized_to_raw.setdefault(normalized_mac, normalized_mac)
 
             if _LOGGER.isEnabledFor(logging.DEBUG) and active_macs_raw:
                 _LOGGER.debug(
@@ -874,13 +1026,10 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     ", ".join(sorted(active_macs_raw)),
                 )
 
-            #  Get enabled tracked MACs (entities enabled in HA)
-            enabled_tracked_macs = self.get_enabled_tracked_macs()
             #  Get all registered MACs (includes disabled entries) in normalized form
             registered_macs = self.get_registered_macs()
-            detailed_macs, detailed_explicit = self.get_detailed_macs()
-            if not detailed_macs and not detailed_explicit:
-                detailed_macs = enabled_tracked_macs
+            #  Detailed polling is explicitly selected in the options UI.
+            detailed_macs, _ = self.get_detailed_macs()
 
             #  Find MACs that are both in the detailed set and currently active
             detailed_and_active_normalized = detailed_macs & active_macs_normalized
@@ -910,13 +1059,31 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 except Exception as err:
                     _LOGGER.debug("Failed to persist announced clients: %s", err)
 
-            # Queue one-time detailed fetches for unseen MACs (raw identifiers)
+            # Queue one-time detailed fetches for unseen MACs so client names
+            # and basic descriptive attributes can be discovered without
+            # enabling recurring detailed polling for every client.
             enrich_targets = {
                 mac for mac in active_macs_raw
-                if mac not in self._initial_enriched and mac not in self._enrich_pending
+                if (
+                    mac not in self._initial_enriched
+                    and mac not in self._enrich_pending
+                    and mac not in self._enrich_scheduled
+                )
             }
             if new_clients:
                 enrich_targets.update(new_clients)
+            name_refresh_targets = {
+                mac for mac in active_macs_raw
+                if (
+                    mac not in self._enrich_pending
+                    and mac not in self._enrich_scheduled
+                    and mac not in self._identity_enrich_exhausted
+                    and _needs_client_name_refresh(
+                        self.data.get(mac, {}) if isinstance(self.data, dict) else {}
+                    )
+                )
+            }
+            enrich_targets.update(name_refresh_targets)
             # Skip MACs that are about to be fetched via detailed polling anyway
             enrich_targets -= detailed_and_active_macs
             if enrich_targets:
@@ -929,8 +1096,9 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 mac_raw = (client.get("mac-addr") or "").strip().lower()
                 if not mac_raw:
                     continue  # Skip invalid MACs
+                normalized_mac = self._normalize_mac(mac_raw) or mac_raw
 
-                client_data[mac_raw] = {
+                client_data[normalized_mac] = {
                     **self._client_connection_attributes(client),
                     "last_seen": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
                     "connected": True,
@@ -1869,23 +2037,6 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.debug("Failed to persist snapshot for %s: %s", mac, err)
 
-    def get_enabled_tracked_macs(self):
-        """MACs of enabled device trackers for this config entry."""
-        entity_registry = er.async_get(self.hass)
-        macs: set[str] = set()
-        for entity_id, entity in entity_registry.entities.items():
-            if (
-                entity_id.startswith("device_tracker.")
-                and not entity.disabled
-                and entity.platform == DOMAIN
-                and entity.config_entry_id == self.entry_id
-                and entity.unique_id
-            ):
-                normalized_mac = self._mac_from_tracker_unique_id(entity.unique_id)
-                if normalized_mac:
-                    macs.add(normalized_mac)
-        return macs
-
     def get_registered_macs(self, *, normalized: bool = True):
         """MACs of registered device trackers for this config entry.
 
@@ -1938,10 +2089,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 _is_meaningful(existing.get(slot))
                 for slot in ("previous_roam_1", "previous_roam_2", "previous_roam_3")
             )
-            has_dc_info = all(
-                _is_meaningful(existing.get(attr))
-                for attr in ["device-name", "device-type", "device-os"]
-            )
+            has_dc_info = _has_client_name(existing)
 
             # Define API calls from a single source of truth
             def _client_url(key: str) -> str:
@@ -2048,8 +2196,11 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     elif key == "device":
                         # Only include device fields if present; avoid overriding with None/Unknown
                         dn = items.get("device-name")
-                        if _is_meaningful(dn):
+                        if "device-name" in items:
+                            self._record_identity_name_observation(mac, items)
+                        if real_client_name(items):
                             attributes["device-name"] = dn
+                            self._identity_enrich_exhausted.discard(mac)
                             received_meaningful = True
                         dt = items.get("device-type")
                         if _is_meaningful(dt):
@@ -2058,6 +2209,34 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                         dos = items.get("device-os")
                         if _is_meaningful(dos):
                             attributes["device-os"] = dos
+                            received_meaningful = True
+                        protocol_map = items.get("protocol-map")
+                        if _is_meaningful(protocol_map):
+                            attributes["protocol-map"] = protocol_map
+                            received_meaningful = True
+                        confidence = items.get("confidence-level")
+                        if _is_meaningful(confidence):
+                            attributes["confidence-level"] = confidence
+                            received_meaningful = True
+                        classified_time = items.get("classified-time")
+                        if _is_meaningful(classified_time):
+                            attributes["classified-time"] = classified_time
+                            received_meaningful = True
+                        day_zero_dc = items.get("day-zero-dc")
+                        if _is_meaningful(day_zero_dc):
+                            attributes["day-zero-dc"] = day_zero_dc
+                            received_meaningful = True
+                        device_vendor = items.get("device-vendor")
+                        if _is_meaningful(device_vendor):
+                            attributes["device-vendor"] = device_vendor
+                            received_meaningful = True
+                        device_protocol = items.get("device-protocol")
+                        if _is_meaningful(device_protocol):
+                            attributes["device-protocol"] = device_protocol
+                            received_meaningful = True
+                        device_sub_version = items.get("device-sub-version")
+                        if _is_meaningful(device_sub_version):
+                            attributes["device-sub-version"] = device_sub_version
                             received_meaningful = True
 
                     elif key == "roaming_history":
@@ -2078,10 +2257,11 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                                     formatted_roaming.append(f"{ap_name} at {formatted_time}")
 
                             if formatted_roaming:
-                                attributes["most_recent_roam"] = formatted_roaming[0] if len(formatted_roaming) > 0 else None
-                                attributes["previous_roam_1"] = formatted_roaming[1] if len(formatted_roaming) > 1 else None
-                                attributes["previous_roam_2"] = formatted_roaming[2] if len(formatted_roaming) > 2 else None
-                                attributes["previous_roam_3"] = formatted_roaming[3] if len(formatted_roaming) > 3 else None
+                                limited_roaming = formatted_roaming[:ROAM_HISTORY_LIMIT]
+                                attributes["roaming_history"] = limited_roaming
+                                attributes["most_recent_roam"] = limited_roaming[0]
+                                for index, roam in enumerate(limited_roaming[1:], start=1):
+                                    attributes[f"previous_roam_{index}"] = roam
                                 received_meaningful = True
                 except Exception as err:
                     _LOGGER.error(f"Error processing {key} attributes for MAC {mac}: {err}")

@@ -25,9 +25,17 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import CiscoWLCUpdateCoordinator
-from .utils import build_https_url
+from .utils import (
+    best_client_label,
+    build_client_device_identifier,
+    build_client_unique_id,
+    build_https_url,
+    meaningful_client_label,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+NON_CLIENT_DATA_KEYS = {"wlc_status", "ap_sensors", "ap_devices"}
 
 
 def _format_ap_display_name(raw_name: Any, ap_mac: str) -> str:
@@ -47,6 +55,12 @@ def _native_number(value: Any) -> int | float | None:
     """Return a numeric state already prepared by the coordinator."""
 
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _meaningful_string(value: Any) -> str | None:
+    """Return a stripped string when it carries useful state."""
+
+    return meaningful_client_label(value)
 
 
 @dataclass
@@ -220,6 +234,14 @@ AP_STATUS_SENSOR_DESCRIPTION = SensorEntityDescription(
 )
 
 
+CLIENT_CURRENT_AP_DESCRIPTION = SensorEntityDescription(
+    key="client_current_ap",
+    name="Current AP",
+    translation_key="client_current_ap",
+    icon="mdi:access-point",
+)
+
+
 class CiscoWLCVersionSensor(
     CoordinatorEntity[CiscoWLCUpdateCoordinator], SensorEntity
 ):
@@ -289,6 +311,106 @@ class CiscoWLCVersionSensor(
             self._last_raw_version = version
 
         super()._handle_coordinator_update()
+
+
+class CiscoWLCClientCurrentAPSensor(
+    CoordinatorEntity[CiscoWLCUpdateCoordinator], SensorEntity
+):
+    """Expose a client's current AP name as recorder-friendly state history."""
+
+    entity_description = CLIENT_CURRENT_AP_DESCRIPTION
+    _attr_should_poll = False
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        coordinator: CiscoWLCUpdateCoordinator,
+        config_entry: ConfigEntry,
+        mac: str,
+    ) -> None:
+        super().__init__(coordinator)
+        self._entry = config_entry
+        normalized = coordinator._normalize_mac(mac)
+        self._mac = normalized or str(mac).strip().lower()
+        self._attr_unique_id = (
+            f"{build_client_unique_id(coordinator.host, self._mac)}"
+            f"_{self.entity_description.key}"
+        )
+
+    def _client_record(self) -> dict[str, Any]:
+        data = self.coordinator.data if isinstance(self.coordinator.data, dict) else {}
+        record = data.get(self._mac)
+        if isinstance(record, dict):
+            return record
+
+        for key, value in data.items():
+            if key in NON_CLIENT_DATA_KEYS or not isinstance(value, dict):
+                continue
+            normalized = self.coordinator._normalize_mac(key)
+            if normalized == self._mac:
+                return value
+        return {}
+
+    @property
+    def available(self) -> bool:
+        detailed_macs, _ = self.coordinator.get_detailed_macs()
+        return bool(self.coordinator.last_update_success and self._mac in detailed_macs)
+
+    @property
+    def native_value(self) -> str | None:
+        record = self._client_record()
+        if not record:
+            return None
+        if record.get("connected") is False:
+            return "not_home"
+        return _meaningful_string(record.get("ap-name"))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        record = self._client_record()
+        attrs: dict[str, Any] = {"client_mac": self._mac}
+        for api_key, attr_key in (
+            ("ssid", "ssid"),
+            ("current-channel", "current_channel"),
+            ("connected", "connected"),
+            ("last_seen", "last_seen"),
+            ("attributes_updated", "attributes_updated"),
+            ("roaming_history", "roaming_history"),
+            ("most_recent_roam", "most_recent_roam"),
+            ("previous_roam_1", "previous_roam_1"),
+            ("previous_roam_2", "previous_roam_2"),
+            ("previous_roam_3", "previous_roam_3"),
+            ("previous_roam_4", "previous_roam_4"),
+            ("previous_roam_5", "previous_roam_5"),
+            ("previous_roam_6", "previous_roam_6"),
+        ):
+            if api_key in record and record[api_key] is not None:
+                attrs[attr_key] = record[api_key]
+        return attrs
+
+    def _client_display_name(self) -> str:
+        record = self._client_record()
+        label = best_client_label(record)
+        suffix_parts = (
+            self._mac.split(":")[-2:] if ":" in self._mac else [self._mac[-5:]]
+        )
+        suffix = ":".join(suffix_parts)
+        if label:
+            return f"{label} {suffix}"
+        return f"Client {suffix}"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={
+                (
+                    DOMAIN,
+                    build_client_device_identifier(self.coordinator.host, self._mac),
+                )
+            },
+            name=self._client_display_name(),
+            via_device=(DOMAIN, self.coordinator.entry_id),
+        )
 
 
 class CiscoWLCAPEnvironmentSensor(
@@ -654,7 +776,7 @@ async def async_setup_entry(
     known_sensors: set[tuple[str, str, int | None]] = set()
 
     @callback
-    def _async_add_ap_entities() -> None:
+    def _async_add_dynamic_entities() -> None:
         data = coordinator.data if isinstance(coordinator.data, dict) else {}
 
         env_data = data.get("ap_sensors") if isinstance(data, dict) else {}
@@ -662,6 +784,25 @@ async def async_setup_entry(
         if not isinstance(device_data, dict):
             device_data = {}
         new_entities: list[SensorEntity] = []
+        detailed_macs, _ = coordinator.get_detailed_macs()
+
+        for mac, info in data.items():
+            if mac in NON_CLIENT_DATA_KEYS or not isinstance(info, dict):
+                continue
+            normalized = coordinator._normalize_mac(mac)
+            if not normalized or normalized not in detailed_macs:
+                continue
+            key = (normalized, CLIENT_CURRENT_AP_DESCRIPTION.key, None)
+            if key in known_sensors:
+                continue
+            new_entities.append(
+                CiscoWLCClientCurrentAPSensor(
+                    coordinator,
+                    entry,
+                    normalized,
+                )
+            )
+            known_sensors.add(key)
 
         if isinstance(env_data, dict):
             for mac, info in env_data.items():
@@ -741,5 +882,5 @@ async def async_setup_entry(
         if new_entities:
             async_add_entities(new_entities)
 
-    _async_add_ap_entities()
-    coordinator.async_add_listener(_async_add_ap_entities)
+    _async_add_dynamic_entities()
+    coordinator.async_add_listener(_async_add_dynamic_entities)

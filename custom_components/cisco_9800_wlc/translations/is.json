@@ -7,13 +7,12 @@
         "step": {
             "user": {
                 "title": "Setja upp Cisco 9800 WLC",
-                "description": "{setup_hint}\n\n{connection_hint}\n\n{new_entities_hint}",
+                "description": "{setup_hint}\n\n{connection_hint}",
                 "data": {
                     "host": "IP-tala WLC",
                     "username": "Notandanafn",
                     "password": "Lykilorð",
-                    "ignore_ssl": "Hunsa sjálf-undirritað SSL-vottorð",
-                    "enable_new_entities": "Gera nýjar uppgötvaðar græjur óvirkar sjálfgefið"
+                    "ignore_ssl": "Hunsa sjálf-undirritað SSL-vottorð"
                 },
                 "errors": {
                     "cannot_connect": "Gat ekki tengst Cisco 9800 WLC. Athugaðu IP-tölu og aðgangsupplýsingar.",
@@ -29,10 +28,9 @@
             "init": {
                 "title": "Stillingar fyrir Cisco 9800 WLC",
                 "data": {
-                    "enable_new_entities": "Gera nýjar uppgötvaðar græjur óvirkar sjálfgefið",
                     "scan_interval": "Tíðni reglulegra kannana (sek.)",
                     "ap_detail_interval": "Uppfærslutíðni AP-lýsinga/útvarps (sek.)",
-                    "detailed_macs": "Veldu viðskiptavini fyrir ítarlega gagnaöflun"
+                    "detailed_macs": "Veldu viðskiptavini fyrir endurtekna ítarlega gagnaöflun"
                 }
             }
         }
@@ -46,6 +44,9 @@
         "sensor": {
             "software_version": {
                 "name": "Hugbúnaðarútgáfa Cisco 9800 WLC"
+            },
+            "client_current_ap": {
+                "name": "Núverandi AP"
             },
             "ap_temperature": {
                 "name": "Hitastig"

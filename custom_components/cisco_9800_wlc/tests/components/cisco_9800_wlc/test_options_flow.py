@@ -19,10 +19,19 @@ class DummyCoordinator:
         self.data = {
             "aa:bb:cc:dd:ee:ff": {"device-name": "Phone"},
             "bb:cc:dd:ee:ff:00": {"device-type": "Tablet"},
+            "f0:b3:ec:14:97:8f": {
+                "device-name": "Unknown",
+                "device-vendor": "Apple",
+                "device-os": "iOS 26.5",
+            },
         }
 
     def get_registered_macs(self) -> set[str]:
-        return {"aa:bb:cc:dd:ee:ff", "bb:cc:dd:ee:ff:00"}
+        return {
+            "aa:bb:cc:dd:ee:ff",
+            "bb:cc:dd:ee:ff:00",
+            "f0:b3:ec:14:97:8f",
+        }
 
 
 async def test_options_flow_updates_detailed_macs(hass) -> None:
@@ -36,7 +45,6 @@ async def test_options_flow_updates_detailed_macs(hass) -> None:
             CONF_IGNORE_SSL: False,
         },
         options={
-            "enable_new_entities": False,
             CONF_DETAILED_MACS: ["aa:bb:cc:dd:ee:ff"],
             CONF_SCAN_INTERVAL: 120,
         },
@@ -52,7 +60,6 @@ async def test_options_flow_updates_detailed_macs(hass) -> None:
     result = await hass.config_entries.options.async_configure(
         init_result["flow_id"],
         {
-            "enable_new_entities": True,
             CONF_SCAN_INTERVAL: 3,
             CONF_DETAILED_MACS: {
                 "aa:bb:cc:dd:ee:ff": True,
@@ -63,6 +70,5 @@ async def test_options_flow_updates_detailed_macs(hass) -> None:
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     options = result["data"]
-    assert options["enable_new_entities"] is True
     assert options[CONF_DETAILED_MACS] == ["aa:bb:cc:dd:ee:ff"]
     assert options[CONF_SCAN_INTERVAL] == 5  # clamped to minimum

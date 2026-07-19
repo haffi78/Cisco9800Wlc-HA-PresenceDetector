@@ -22,9 +22,11 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN, SIGNAL_NEW_CLIENTS
 from .coordinator import CiscoWLCUpdateCoordinator, parse_to_local_datetime
 from .utils import (
+    best_client_label,
     build_client_device_identifier,
     build_client_unique_id,
     client_mac_from_unique_id,
+    real_client_name,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -35,6 +37,8 @@ _LOGGER = logging.getLogger(__name__)
 # -------------------------
 class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity):
     """Represents a tracked client device connected to the Cisco WLC."""
+
+    _attr_has_entity_name = True
 
     def __init__(
         self,
@@ -50,8 +54,11 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
         self.mac = mac
         self.data = data or self.coordinator.data.get(self.mac, {})
         self._attr_should_poll = False  #  Polling is not needed
-        self._enable_by_default = enable_by_default  #  Store user preference
-        self._attr_name = self._current_friendly_name()
+        # Presence trackers are cheap: the main WLC client-list poll already has
+        # the connected/disconnected state. Detailed polling is controlled by
+        # the dedicated detailed_macs option, not by entity enablement.
+        self._enable_by_default = True
+        self._attr_name = None
 
 
     @property
@@ -78,20 +85,13 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
     @property
     def entity_registry_enabled_default(self) -> bool:
         """Return whether the entity is enabled by default."""
-        return self._enable_by_default  #  Use user setting from config entry
+        return True
 
     @property
-    def name(self) -> str:
-        """Return a friendly, stable name with MAC suffix.
+    def name(self) -> str | None:
+        """Return no entity-specific name for the primary client tracker."""
 
-        Preference order:
-        1) Device Name (e.g., a hostname like "blackeys-phone")
-        2) Device Type (e.g., model)
-        3) Device OS
-        Else fallback to the MAC address.
-        Always append last 2 MAC bytes for disambiguation: " Name ee:ff".
-        """
-        return self._current_friendly_name()
+        return None
 
     @property
     def is_connected(self) -> bool:
@@ -124,10 +124,21 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
             "Device Name": None,
             "Device Type": None,
             "Device OS": None,
-            "Most Recent Roam": None, 
-            "Previous Roam 2": None,   
-            "Previous Roam 1": None,   
-            "Previous Roam 3": None, 
+            "Device Vendor": None,
+            "Device Protocol": None,
+            "Device Sub Version": None,
+            "Protocol Map": None,
+            "Classification Confidence": None,
+            "Classified Time": None,
+            "Day Zero Classification": None,
+            "Roaming History": None,
+            "Most Recent Roam": None,
+            "Previous Roam 1": None,
+            "Previous Roam 2": None,
+            "Previous Roam 3": None,
+            "Previous Roam 4": None,
+            "Previous Roam 5": None,
+            "Previous Roam 6": None,
             "IP Address": None,
             "IPv4 Address": None,
             "IPv6 Address": None,
@@ -136,9 +147,6 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
             "WifiStandard": None,
             "Last Seen": None,
             "Attributes Updated": None,
-
-
-            
         }
 
         # Mapping HA attribute keys to API attribute names
@@ -156,10 +164,21 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
             "Device Name": "device-name",
             "Device Type": "device-type",
             "Device OS": "device-os",
-            "Most Recent Roam": "most_recent_roam",  
-            "Previous Roam 1": "previous_roam_1",    
-            "Previous Roam 2": "previous_roam_2",    
-            "Previous Roam 3": "previous_roam_3",   
+            "Device Vendor": "device-vendor",
+            "Device Protocol": "device-protocol",
+            "Device Sub Version": "device-sub-version",
+            "Protocol Map": "protocol-map",
+            "Classification Confidence": "confidence-level",
+            "Classified Time": "classified-time",
+            "Day Zero Classification": "day-zero-dc",
+            "Roaming History": "roaming_history",
+            "Most Recent Roam": "most_recent_roam",
+            "Previous Roam 1": "previous_roam_1",
+            "Previous Roam 2": "previous_roam_2",
+            "Previous Roam 3": "previous_roam_3",
+            "Previous Roam 4": "previous_roam_4",
+            "Previous Roam 5": "previous_roam_5",
+            "Previous Roam 6": "previous_roam_6",
             "WifiStandard": "WifiStandard",
             "Username": "username",
             "Last Seen": "last_seen",
@@ -169,12 +188,18 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
         merged_attributes: dict[str, Any] = {}
 
         for ha_key, api_key in attribute_key_mapping.items():
-            if api_key in attributes and attributes[api_key] is not None:
+            if ha_key == "Device Name":
+                merged_attributes[ha_key] = (
+                    real_client_name(attributes)
+                    if api_key in attributes
+                    else default_attributes.get(ha_key, None)
+                )
+            elif api_key in attributes and attributes[api_key] is not None:
                 merged_attributes[ha_key] = attributes[api_key]
             else:
                 merged_attributes[ha_key] = default_attributes.get(ha_key, None)
 
-        for time_key in ("Last Seen", "Attributes Updated"):
+        for time_key in ("Last Seen", "Attributes Updated", "Classified Time"):
             value = merged_attributes.get(time_key)
             if value:
                 formatted = _format_timestamp(value)
@@ -191,13 +216,9 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
             if isinstance(self.coordinator.data, dict)
             else {}
         )
-        name_candidate = (
-            attributes.get("device-name")
-            or attributes.get("device-type")
-            or attributes.get("device-os")
-        )
-        if isinstance(name_candidate, str) and name_candidate.strip():
-            return name_candidate.strip()
+        label = best_client_label(attributes)
+        if label:
+            return label
         return self.mac
 
     def _mac_suffix(self) -> str:
@@ -225,10 +246,7 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
         return f"{base} {suffix}"
 
     def _device_registry_label(self) -> str:
-        base = self._base_name()
-        if base == self.mac:
-            return f"Client {self._mac_suffix()}"
-        return base
+        return self._current_friendly_name()
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -249,7 +267,7 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
             device_registry.async_update_device(device.id, name=desired_name)
 
     def _handle_coordinator_update(self) -> None:
-        self._attr_name = self._current_friendly_name()
+        self._attr_name = None
         super()._handle_coordinator_update()
         self.hass.async_create_task(self._async_update_device_registry_name())
 # -------------------------
@@ -283,8 +301,6 @@ async def async_setup_entry(
     tracked_entries = cast(dict[str, set[str]], tracked_entries)
     tracked_macs = set()
     tracked_entries[entry.entry_id] = tracked_macs
-    enable_new_entities = entry.options.get("enable_new_entities", False)
-    
     # Controller status is now provided via binary_sensor platform
 
     # Fetch initial list of clients from WLC
@@ -296,9 +312,10 @@ async def async_setup_entry(
             continue
         if key == "wlc_status":
             continue
-        if coordinator._normalize_mac(key) is None:
+        normalized = coordinator._normalize_mac(key)
+        if normalized is None:
             continue
-        all_active_clients.add(key)
+        all_active_clients.add(normalized)
 
     #  **Step 1: Retrieve all known devices from Home Assistant**
     entity_registry = er.async_get(hass)
@@ -322,6 +339,13 @@ async def async_setup_entry(
             if not normalized_uid:
                 _LOGGER.debug("Skipping invalid MAC unique_id %s", uid)
                 continue
+
+            disabled_by = getattr(entity_entry, "disabled_by", None)
+            if disabled_by == er.RegistryEntryDisabler.INTEGRATION:
+                entity_registry.async_update_entity(
+                    entity_entry.entity_id,
+                    disabled_by=None,
+                )
 
             scoped_uid = build_client_unique_id(coordinator.host, normalized_uid)
             if uid != scoped_uid and not entity_registry.async_get_entity_id(
@@ -348,11 +372,19 @@ async def async_setup_entry(
     # **Step 3: Register All Clients in Home Assistant**
     clients_to_add: list[CiscoWLCClient] = []
     for mac in all_clients:
-        if coordinator._normalize_mac(mac) is None:
+        normalized = coordinator._normalize_mac(mac)
+        if normalized is None:
             continue
-        if mac not in tracked_macs:
-            clients_to_add.append(CiscoWLCClient(coordinator, mac, coordinator.data.get(mac, {}), enable_new_entities))
-            tracked_macs.add(mac)
+        if normalized not in tracked_macs:
+            clients_to_add.append(
+                CiscoWLCClient(
+                    coordinator,
+                    normalized,
+                    coordinator.data.get(normalized, {}),
+                    True,
+                )
+            )
+            tracked_macs.add(normalized)
 
     if clients_to_add:
         _LOGGER.debug("Registering %d device trackers in Home Assistant", len(clients_to_add))
@@ -371,19 +403,20 @@ async def async_setup_entry(
             return
         new_entities: list[CiscoWLCClient] = []
         for mac in new_macs:
-            if coordinator._normalize_mac(mac) is None:
+            normalized = coordinator._normalize_mac(mac)
+            if normalized is None:
                 continue
-            if mac in tracked_macs:
+            if normalized in tracked_macs:
                 continue
             new_entities.append(
                 CiscoWLCClient(
                     coordinator,
-                    mac,
-                    coordinator.data.get(mac, {}),
-                    enable_new_entities,
+                    normalized,
+                    coordinator.data.get(normalized, {}),
+                    True,
                 )
             )
-            tracked_macs.add(mac)
+            tracked_macs.add(normalized)
         if new_entities:
             _LOGGER.debug("Adding %d newly discovered client(s)", len(new_entities))
             hass.add_job(async_add_entities, new_entities)

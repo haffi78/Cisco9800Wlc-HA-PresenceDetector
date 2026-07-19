@@ -24,7 +24,7 @@ from .const import (
     DEFAULT_AP_DETAIL_INTERVAL,
 )
 from .coordinator import DEFAULT_SCAN_INTERVAL, CiscoWLCUpdateCoordinator
-from .utils import build_https_url
+from .utils import best_client_label, build_https_url
 
 MAC_REGEX_COLON = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 MAC_REGEX_HYPHEN = re.compile(r"^([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$")
@@ -60,7 +60,6 @@ DATA_SCHEMA = vol.Schema(
             selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
         ),
         vol.Optional(CONF_IGNORE_SSL, default=False): selector.BooleanSelector(),
-        vol.Optional("enable_new_entities", default=False): selector.BooleanSelector(),
     }
 )
 
@@ -141,7 +140,6 @@ class CiscoWLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_IGNORE_SSL: ignore_ssl,
                 }
                 options = {
-                    "enable_new_entities": user_input.get("enable_new_entities", False),
                     CONF_DETAILED_MACS: [],
                 }
                 return self.async_create_entry(
@@ -157,7 +155,6 @@ class CiscoWLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders={
                 "setup_hint": "Make sure RESTCONF is enabled on your WLC before proceeding.",
                 "connection_hint": "Enter the connection details to your Cisco 9800 WLC.",
-                "new_entities_hint": "Entities are disabled by default to avoid creating trackers automatically.",
             },
         )
 
@@ -313,14 +310,9 @@ def _build_mac_options(
         label = mac
         details = coordinator_data.get(mac) if isinstance(coordinator_data, dict) else None
         if isinstance(details, dict):
-            friendly = (
-                details.get("device-name")
-                or details.get("device-type")
-                or details.get("device-os")
-                or details.get("ssid")
-            )
-            if isinstance(friendly, str) and friendly.strip():
-                label = f"{friendly.strip()} ({mac})"
+            friendly = best_client_label(details)
+            if friendly:
+                label = f"{friendly} ({mac})"
         options[mac] = label
     return options
 
@@ -339,10 +331,9 @@ class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
             return self._option_labels
 
         defaults = {
-            "enable_new_entities": "Disable newly discovered devices by default",
             "scan_interval": "Polling interval (seconds)",
             "ap_detail_interval": "AP inventory/radio refresh interval (seconds)",
-            "detailed_macs": "Clients to poll for detailed telemetry",
+            "detailed_macs": "Clients to poll repeatedly for detailed telemetry",
         }
 
         try:
@@ -370,7 +361,6 @@ class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
         self, user_input: Mapping[str, Any] | None = None
     ) -> FlowResult:
         """Present and process the options form."""
-        current_enable_new = self._config_entry.options.get("enable_new_entities", False)
         stored_detailed: list[str] = self._config_entry.options.get(CONF_DETAILED_MACS, []) or []
         current_detailed = [mac for mac in (normalize_mac(m) for m in stored_detailed) if mac]
         current_interval = int(
@@ -391,7 +381,6 @@ class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
         mac_choices = _build_mac_options(self.hass, coordinator, current_detailed)
 
         labels = await self._async_get_option_labels()
-        label_enable_new = labels["enable_new_entities"]
         label_scan_interval = labels["scan_interval"]
         label_ap_detail = labels["ap_detail_interval"]
         label_detailed_macs = labels["detailed_macs"]
@@ -430,9 +419,6 @@ class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
                 ap_interval_value = current_ap_interval
 
             new_options = {
-                "enable_new_entities": bool(
-                    _input_value("enable_new_entities", label_enable_new, current_enable_new)
-                ),
                 CONF_DETAILED_MACS: sorted(normalized_selected),
                 CONF_SCAN_INTERVAL: max(5, interval_value),
                 CONF_AP_DETAIL_INTERVAL: max(60, ap_interval_value),
@@ -440,7 +426,6 @@ class CiscoWLCOptionsFlow(config_entries.OptionsFlow):
             return self.async_create_entry(title="", data=new_options)
 
         fields: dict[Any, Any] = {
-            vol.Optional(label_enable_new, default=current_enable_new): selector.BooleanSelector(),
             vol.Optional(label_scan_interval, default=current_interval): vol.All(
                 vol.Coerce(int), vol.Range(min=5, max=3600)
             ),

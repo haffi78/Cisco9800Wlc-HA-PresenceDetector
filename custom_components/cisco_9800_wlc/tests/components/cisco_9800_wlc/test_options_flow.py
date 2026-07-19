@@ -12,12 +12,19 @@ from custom_components.cisco_9800_wlc.const import (
     CONF_SCAN_INTERVAL,
     DOMAIN,
 )
+from custom_components.cisco_9800_wlc.utils import (
+    CLIENT_NAME_VERIFIED_FIELD,
+    CLIENT_NAME_VERIFIED_VALUE,
+)
 
 
 class DummyCoordinator:
     def __init__(self) -> None:
         self.data = {
-            "aa:bb:cc:dd:ee:ff": {"device-name": "Phone"},
+            "aa:bb:cc:dd:ee:ff": {
+                "device-name": "Phone",
+                CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+            },
             "bb:cc:dd:ee:ff:00": {"device-type": "Tablet"},
             "f0:b3:ec:14:97:8f": {
                 "device-name": "Unknown",

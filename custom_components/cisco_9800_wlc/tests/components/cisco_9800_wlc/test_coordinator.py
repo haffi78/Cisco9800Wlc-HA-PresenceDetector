@@ -23,6 +23,10 @@ from custom_components.cisco_9800_wlc.coordinator import (
     _is_meaningful,
 )
 from custom_components.cisco_9800_wlc.const import CONF_DETAILED_MACS, DOMAIN
+from custom_components.cisco_9800_wlc.utils import (
+    CLIENT_NAME_VERIFIED_FIELD,
+    CLIENT_NAME_VERIFIED_VALUE,
+)
 
 FIXTURE_DIR = Path(__file__).parents[2] / "fixtures" / "cisco_9800_wlc"
 AP_MAC = "34:5d:a8:0a:2e:40"
@@ -56,14 +60,110 @@ def test_cached_client_detail_detection() -> None:
     assert _has_client_detail({"ssid": "Home"}) is True
 
 
-def test_any_non_placeholder_device_name_is_real_client_name() -> None:
-    """Only Cisco's explicit name placeholders should keep identity refreshes open."""
+def test_unverified_cached_device_name_is_not_real_client_name() -> None:
+    """Only names verified by current dc-info parsing should close refreshes."""
 
-    assert _has_client_name({"device-name": "APPLE, INC."}) is True
-    assert _has_client_name({"device-name": "Un-Classified Device"}) is True
+    assert _has_client_name({"device-name": "APPLE, INC."}) is False
+    assert _has_client_name({"device-name": "Un-Classified Device"}) is False
     assert _has_client_name({"device-name": "Unknown"}) is False
     assert _has_client_name({"device-name": "Unknown Device"}) is False
-    assert _has_client_name({"device-name": "blackey-iphone"}) is True
+    assert _has_client_name({"device-name": "blackey-iphone"}) is False
+    assert (
+        _has_client_name(
+            {
+                "device-name": "blackey-iphone",
+                CLIENT_NAME_VERIFIED_FIELD: True,
+            }
+        )
+        is False
+    )
+    assert (
+        _has_client_name(
+            {
+                "device-name": "APPLE, INC.",
+                CLIENT_NAME_VERIFIED_FIELD: "dc-info-device-name-v3",
+            }
+        )
+        is False
+    )
+    assert (
+        _has_client_name(
+            {
+                "device-name": "APPLE, INC.",
+                "day-zero-dc": "APPLE, INC.",
+                CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+            }
+        )
+        is False
+    )
+    assert (
+        _has_client_name(
+            {
+                "device-name": "SONOS, INC.",
+                "day-zero-dc": "SONOS, INC.",
+                CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+            }
+        )
+        is False
+    )
+    assert (
+        _has_client_name(
+            {
+                "device-name": "blackey-iphone",
+                "day-zero-dc": "APPLE, INC.",
+                CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+            }
+        )
+        is True
+    )
+    assert (
+        _has_client_name(
+            {
+                "device-name": "APPLE, INC.",
+                "protocol-map": "protocol-map-oui",
+                CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+            }
+        )
+        is False
+    )
+    assert (
+        _has_client_name(
+            {
+                "device-name": "blackey-iphone",
+                "protocol-map": "protocol-map-oui protocol-map-dhcp",
+                CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+            }
+        )
+        is True
+    )
+    assert (
+        _has_client_name(
+            {
+                "device-name": "SONOS, INC.",
+                "day-zero-dc": "ACME",
+                CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+            }
+        )
+        is True
+    )
+    assert (
+        _has_client_name(
+            {
+                "device-name": "blackey-iphone",
+                CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+            }
+        )
+        is True
+    )
+    assert (
+        _has_client_name(
+            {
+                "device-name": "Un-Classified Device",
+                CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+            }
+        )
+        is True
+    )
 
 
 def test_identity_placeholder_observations_stop_after_initial_plus_five_retries(
@@ -94,10 +194,39 @@ def test_identity_placeholder_observations_stop_after_initial_plus_five_retries(
     assert mac in coordinator._identity_enrich_exhausted
 
 
+def test_identity_day_zero_name_observations_stop_after_retries(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Repeated day-zero classification names should stop identity retries."""
+
+    mac = "80:b9:89:7b:62:2d"
+    with patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_get_clientsession",
+        return_value=MockSession([]),
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.CiscoWLCUpdateCoordinator._start_enrich_worker",
+        return_value=None,
+    ):
+        coordinator = CiscoWLCUpdateCoordinator(
+            hass,
+            coordinator_config,
+            "entry_identity_day_zero_observations",
+        )
+
+    value = {"device-name": "APPLE, INC.", "day-zero-dc": "apple, inc."}
+    for _ in range(5):
+        coordinator._record_identity_name_observation(mac, value)
+    assert mac not in coordinator._identity_enrich_exhausted
+
+    coordinator._record_identity_name_observation(mac, value)
+
+    assert mac in coordinator._identity_enrich_exhausted
+
+
 def test_identity_non_placeholder_name_observation_clears_retries(
     hass: HomeAssistant, coordinator_config: dict
 ) -> None:
-    """Any non-placeholder Cisco device-name should be treated as final."""
+    """Cisco device-name should be final when it differs from day-zero-dc."""
 
     mac = "80:b9:89:7b:62:2d"
     with patch(
@@ -118,11 +247,7 @@ def test_identity_non_placeholder_name_observation_clears_retries(
 
     coordinator._record_identity_name_observation(
         mac,
-        {
-            "device-name": "APPLE, INC.",
-            "device-os": "iPhone16,2",
-            "day-zero-dc": "APPLE, INC.",
-        },
+        {"device-name": "blackey-iphone", "day-zero-dc": "APPLE, INC."},
     )
 
     assert mac not in coordinator._identity_enrich_exhausted
@@ -339,7 +464,12 @@ async def test_manual_detailed_selection_triggers_detail_polling(
             {"mac-addr": mac}
         ]
     }
-    mock_fetch = AsyncMock(return_value={"device-name": "Phone"})
+    mock_fetch = AsyncMock(
+        return_value={
+            "device-name": "Phone",
+            CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+        }
+    )
 
     with patch(
         "custom_components.cisco_9800_wlc.coordinator.async_get_clientsession",
@@ -371,7 +501,7 @@ async def test_manual_detailed_selection_triggers_detail_polling(
         coordinator._last_version_fetch = datetime.now()
         data = await coordinator._async_update_data()
 
-    mock_fetch.assert_called_once_with(mac)
+    mock_fetch.assert_called_once_with(mac, refresh_identity=True)
     assert data[mac]["device-name"] == "Phone"
 
 
@@ -473,6 +603,68 @@ async def test_placeholder_client_name_schedules_one_shot_refresh(
     mock_schedule.assert_called_once_with({mac}, INITIAL_ENRICH_DELAY_SECONDS)
     assert data[mac]["device-name"] == "Unknown Device"
     assert data[mac]["connected"] is True
+
+
+@pytest.mark.asyncio
+async def test_reconnected_unnamed_client_resets_identity_exhaustion(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """Reconnect should retry names that may appear after DHCP/HTTP profiling."""
+
+    mac = "80:b9:89:7b:62:2d"
+    response_payload = {
+        "Cisco-IOS-XE-wireless-client-oper:sisf-db-mac": [
+            {"mac-addr": mac}
+        ]
+    }
+
+    with patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_get_clientsession",
+        return_value=MockSession([MockClientResponse(200, response_payload)]),
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.CiscoWLCUpdateCoordinator._start_enrich_worker",
+        return_value=None,
+    ), patch.object(
+        CiscoWLCUpdateCoordinator,
+        "_schedule_enrich_with_delay",
+    ) as mock_schedule, patch.object(
+        CiscoWLCUpdateCoordinator,
+        "_async_fetch_ap_environment",
+        new=AsyncMock(return_value={}),
+    ), patch.object(
+        CiscoWLCUpdateCoordinator,
+        "_async_update_ap_devices",
+        new=AsyncMock(return_value=None),
+    ):
+        coordinator = CiscoWLCUpdateCoordinator(
+            hass,
+            coordinator_config,
+            "entry_reconnected_name",
+            options={CONF_DETAILED_MACS: []},
+        )
+        coordinator.data = {
+            mac: {
+                "connected": False,
+                "device-name": "APPLE, INC.",
+                "day-zero-dc": "APPLE, INC.",
+                CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+            }
+        }
+        coordinator._initial_enriched.add(mac)
+        coordinator._announced_new_clients.add(mac)
+        coordinator._identity_enrich_exhausted.add(mac)
+        coordinator._enrich_attempts[mac] = 5
+        coordinator._identity_name_observations[mac] = [True, True, True, True, True]
+        coordinator._last_version_fetch = datetime.now()
+
+        data = await coordinator._async_update_data()
+
+    assert mac not in coordinator._identity_enrich_exhausted
+    assert mac not in coordinator._enrich_attempts
+    assert mac not in coordinator._identity_name_observations
+    mock_schedule.assert_called_once_with({mac}, INITIAL_ENRICH_DELAY_SECONDS)
+    assert data[mac]["connected"] is True
+    assert data[mac]["device-name"] == "APPLE, INC."
 
 
 def test_client_connection_attributes_prefers_non_link_local_ipv6(
@@ -977,6 +1169,7 @@ async def test_fetch_attributes_refreshes_placeholder_device_name(
     attributes = await coordinator.fetch_attributes(mac)
 
     assert attributes["device-name"] == "Kitchen Tablet"
+    assert attributes[CLIENT_NAME_VERIFIED_FIELD] == CLIENT_NAME_VERIFIED_VALUE
     assert (
         attributes["protocol-map"]
         == "protocol-map-oui protocol-map-dhcp protocol-map-http"
@@ -988,14 +1181,15 @@ async def test_fetch_attributes_refreshes_placeholder_device_name(
     assert attributes["device-protocol"] == "DHCP"
     assert attributes["device-sub-version"] == "26.5"
     assert coordinator.data[mac]["device-name"] == "Kitchen Tablet"
+    assert coordinator.data[mac][CLIENT_NAME_VERIFIED_FIELD] == CLIENT_NAME_VERIFIED_VALUE
     assert any("dc-info=" in call.args[0] for call in coordinator._get.await_args_list)
 
 
 @pytest.mark.asyncio
-async def test_fetch_attributes_keeps_non_placeholder_device_name_as_final(
+async def test_fetch_attributes_refreshes_stale_classification_device_name(
     hass: HomeAssistant, coordinator_config: dict
 ) -> None:
-    """Any cached non-placeholder device-name should suppress dc-info refreshes."""
+    """A stale cached classification name should not suppress dc-info refreshes."""
 
     mac = "80:b9:89:7b:62:2d"
     fixtures = [
@@ -1010,6 +1204,19 @@ async def test_fetch_attributes_keeps_non_placeholder_device_name_as_final(
             "Cisco-IOS-XE-wireless-client-oper:mobility-history": {
                 "entry": []
             }
+        },
+        {
+            "Cisco-IOS-XE-wireless-client-oper:dc-info": [
+                {
+                    "device-name": "blackey-iphone",
+                    "device-type": "Apple-Device",
+                    "device-os": "iPhone16,2",
+                    "protocol-map": (
+                        "protocol-map-oui protocol-map-dhcp protocol-map-http"
+                    ),
+                    "day-zero-dc": "APPLE, INC.",
+                }
+            ]
         },
     ]
 
@@ -1029,6 +1236,7 @@ async def test_fetch_attributes_keeps_non_placeholder_device_name_as_final(
     coordinator.data = {
         mac: {
             "device-name": "APPLE, INC.",
+            CLIENT_NAME_VERIFIED_FIELD: "dc-info-device-name-v3",
             "device-type": "Apple-Device",
             "device-os": "iPhone16,2",
             "day-zero-dc": "APPLE, INC.",
@@ -1040,8 +1248,136 @@ async def test_fetch_attributes_keeps_non_placeholder_device_name_as_final(
 
     attributes = await coordinator.fetch_attributes(mac)
 
-    assert "device-name" not in attributes
-    assert coordinator.data[mac]["device-name"] == "APPLE, INC."
-    assert not any(
-        "dc-info=" in call.args[0] for call in coordinator._get.await_args_list
+    assert attributes["device-name"] == "blackey-iphone"
+    assert attributes[CLIENT_NAME_VERIFIED_FIELD] == CLIENT_NAME_VERIFIED_VALUE
+    assert coordinator.data[mac]["device-name"] == "blackey-iphone"
+    assert coordinator.data[mac][CLIENT_NAME_VERIFIED_FIELD] == CLIENT_NAME_VERIFIED_VALUE
+    assert any("dc-info=" in call.args[0] for call in coordinator._get.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_fetch_attributes_preserves_verified_name_on_partial_classification(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """A partial refresh must not replace a verified name with classification."""
+
+    mac = "80:b9:89:7b:62:2d"
+    fixtures = [
+        {"Cisco-IOS-XE-wireless-client-oper:common-oper-data": [{"ap-name": "AP-1"}]},
+        {
+            "Cisco-IOS-XE-wireless-client-oper:dot11-oper-data": [
+                {"current-channel": 11, "vap-ssid": "Home"}
+            ]
+        },
+        {"Cisco-IOS-XE-wireless-client-oper:speed": 100},
+        {
+            "Cisco-IOS-XE-wireless-client-oper:mobility-history": {
+                "entry": []
+            }
+        },
+        {
+            "Cisco-IOS-XE-wireless-client-oper:dc-info": [
+                {
+                    "device-name": "APPLE, INC.",
+                    "device-type": "Apple-Device",
+                    "protocol-map": "protocol-map-oui",
+                    "confidence-level": 10,
+                }
+            ]
+        },
+    ]
+
+    with patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_get_clientsession",
+        return_value=MockSession([]),
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.CiscoWLCUpdateCoordinator._start_enrich_worker",
+        return_value=None,
+    ):
+        coordinator = CiscoWLCUpdateCoordinator(
+            hass,
+            coordinator_config,
+            "entry_preserve_verified_name",
+        )
+
+    coordinator.data = {
+        mac: {
+            "device-name": "blackey-iphone",
+            CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+            "device-type": "Apple-iPhone",
+        }
+    }
+    coordinator._get = AsyncMock(
+        side_effect=[(200, fixture, None) for fixture in fixtures]
     )
+
+    attributes = await coordinator.fetch_attributes(mac, refresh_identity=True)
+
+    assert "device-name" not in attributes
+    assert coordinator.data[mac]["device-name"] == "blackey-iphone"
+    assert coordinator.data[mac][CLIENT_NAME_VERIFIED_FIELD] == CLIENT_NAME_VERIFIED_VALUE
+    assert coordinator.data[mac]["device-type"] == "Apple-Device"
+
+
+@pytest.mark.asyncio
+async def test_fetch_attributes_replaces_verified_name_with_valid_new_name(
+    hass: HomeAssistant, coordinator_config: dict
+) -> None:
+    """A verified name can change when the new name differs from day-zero-dc."""
+
+    mac = "80:b9:89:7b:62:2d"
+    fixtures = [
+        {"Cisco-IOS-XE-wireless-client-oper:common-oper-data": [{"ap-name": "AP-1"}]},
+        {
+            "Cisco-IOS-XE-wireless-client-oper:dot11-oper-data": [
+                {"current-channel": 11, "vap-ssid": "Home"}
+            ]
+        },
+        {"Cisco-IOS-XE-wireless-client-oper:speed": 100},
+        {
+            "Cisco-IOS-XE-wireless-client-oper:mobility-history": {
+                "entry": []
+            }
+        },
+        {
+            "Cisco-IOS-XE-wireless-client-oper:dc-info": [
+                {
+                    "device-name": "blackey-iphone-new",
+                    "device-type": "Apple-iPhone",
+                    "protocol-map": "protocol-map-oui protocol-map-dhcp",
+                    "day-zero-dc": "APPLE, INC.",
+                    "confidence-level": 20,
+                }
+            ]
+        },
+    ]
+
+    with patch(
+        "custom_components.cisco_9800_wlc.coordinator.async_get_clientsession",
+        return_value=MockSession([]),
+    ), patch(
+        "custom_components.cisco_9800_wlc.coordinator.CiscoWLCUpdateCoordinator._start_enrich_worker",
+        return_value=None,
+    ):
+        coordinator = CiscoWLCUpdateCoordinator(
+            hass,
+            coordinator_config,
+            "entry_replace_verified_name",
+        )
+
+    coordinator.data = {
+        mac: {
+            "device-name": "blackey-iphone",
+            CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+            "day-zero-dc": "APPLE, INC.",
+        }
+    }
+    coordinator._get = AsyncMock(
+        side_effect=[(200, fixture, None) for fixture in fixtures]
+    )
+
+    attributes = await coordinator.fetch_attributes(mac, refresh_identity=True)
+
+    assert attributes["device-name"] == "blackey-iphone-new"
+    assert attributes[CLIENT_NAME_VERIFIED_FIELD] == CLIENT_NAME_VERIFIED_VALUE
+    assert coordinator.data[mac]["device-name"] == "blackey-iphone-new"

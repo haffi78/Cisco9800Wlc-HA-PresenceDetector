@@ -5,10 +5,36 @@ from ipaddress import ip_address
 from urllib.parse import quote
 
 CLIENT_UNIQUE_ID_SEPARATOR = "_"
+CLIENT_NAME_VERIFIED_FIELD = "_device_name_verified"
+CLIENT_NAME_VERIFIED_VALUE = "dc-info-device-name-v6"
 PLACEHOLDER_CLIENT_LABELS = {
     "unknown",
     "unknown device",
 }
+
+
+def _normalized_client_label(value: str) -> str:
+    """Return a normalized label for comparing Cisco identity fields."""
+
+    return " ".join(value.strip().casefold().split())
+
+
+def same_client_label(left: object, right: object) -> bool:
+    """Return whether two Cisco identity labels describe the same value."""
+
+    return (
+        isinstance(left, str)
+        and isinstance(right, str)
+        and _normalized_client_label(left) == _normalized_client_label(right)
+    )
+
+
+def _has_only_oui_protocol(value: object) -> bool:
+    """Return whether Cisco only classified the client by vendor OUI."""
+
+    if not isinstance(value, str):
+        return False
+    return set(value.split()) == {"protocol-map-oui"}
 
 
 def meaningful_client_label(value: object) -> str | None:
@@ -22,13 +48,35 @@ def meaningful_client_label(value: object) -> str | None:
     return candidate
 
 
-def real_client_name(attributes: object) -> str | None:
-    """Return Cisco's device-name unless it is one of its name placeholders."""
+def cisco_device_name(attributes: object) -> str | None:
+    """Return Cisco's device-name unless it is a placeholder classification."""
 
     if not isinstance(attributes, dict):
         return None
 
-    return meaningful_client_label(attributes.get("device-name"))
+    device_name = meaningful_client_label(attributes.get("device-name"))
+    if device_name is None:
+        return None
+
+    day_zero = meaningful_client_label(attributes.get("day-zero-dc"))
+    if day_zero is not None and same_client_label(device_name, day_zero):
+        return None
+    if day_zero is None and _has_only_oui_protocol(attributes.get("protocol-map")):
+        return None
+
+    return device_name
+
+
+def real_client_name(attributes: object) -> str | None:
+    """Return a cached Cisco device-name only after current-code verification."""
+
+    if (
+        not isinstance(attributes, dict)
+        or attributes.get(CLIENT_NAME_VERIFIED_FIELD) != CLIENT_NAME_VERIFIED_VALUE
+    ):
+        return None
+
+    return cisco_device_name(attributes)
 
 
 def best_client_label(attributes: object) -> str | None:

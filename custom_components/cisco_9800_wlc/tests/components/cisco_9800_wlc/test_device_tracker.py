@@ -11,6 +11,10 @@ from tests.common import MockConfigEntry
 from custom_components.cisco_9800_wlc.const import DOMAIN
 from custom_components.cisco_9800_wlc.coordinator import CiscoWLCUpdateCoordinator
 from custom_components.cisco_9800_wlc.device_tracker import CiscoWLCClient
+from custom_components.cisco_9800_wlc.utils import (
+    CLIENT_NAME_VERIFIED_FIELD,
+    CLIENT_NAME_VERIFIED_VALUE,
+)
 
 
 def _make_client(
@@ -35,7 +39,13 @@ def _make_client(
 
 def test_client_name_uses_device_name_with_suffix() -> None:
     mac = "aa:bb:cc:dd:ee:ff"
-    client = _make_client(mac, {"device-name": "Haffi iPhone"})
+    client = _make_client(
+        mac,
+        {
+            "device-name": "Haffi iPhone",
+            CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+        },
+    )
 
     assert client.name is None
     assert client._device_registry_label() == "Haffi iPhone ee:ff"
@@ -83,20 +93,21 @@ def test_client_name_uses_default_when_name_is_unknown() -> None:
     assert client._current_friendly_name() == "Client 97:8f"
 
 
-def test_client_name_uses_any_non_placeholder_device_name() -> None:
+def test_client_name_ignores_stale_classification_device_name() -> None:
     mac = "80:b9:89:7b:62:2d"
     client = _make_client(
         mac,
         {
             "device-name": "APPLE, INC.",
+            CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
             "device-type": "Apple-Device",
             "device-os": "iPhone16,2",
             "day-zero-dc": "APPLE, INC.",
         },
     )
 
-    assert client._device_registry_label() == "APPLE, INC. 62:2d"
-    assert client._current_friendly_name() == "APPLE, INC. 62:2d"
+    assert client._device_registry_label() == "Client 62:2d"
+    assert client._current_friendly_name() == "Client 62:2d"
 
 
 def test_client_name_does_not_use_udhcp_vendor_as_label() -> None:
@@ -147,12 +158,13 @@ def test_client_attributes_ignore_unknown_device_placeholder() -> None:
     assert attrs["Device Type"] == "Tablet"
 
 
-def test_client_attributes_keep_non_placeholder_device_name() -> None:
+def test_client_attributes_hide_stale_classification_device_name() -> None:
     mac = "80:b9:89:7b:62:2d"
     client = _make_client(
         mac,
         {
             "device-name": "APPLE, INC.",
+            CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
             "device-type": "Apple-Device",
             "device-os": "iPhone16,2",
             "day-zero-dc": "APPLE, INC.",
@@ -161,7 +173,7 @@ def test_client_attributes_keep_non_placeholder_device_name() -> None:
 
     attrs = client.extra_state_attributes
 
-    assert attrs["Device Name"] == "APPLE, INC."
+    assert attrs["Device Name"] is None
     assert attrs["Day Zero Classification"] == "APPLE, INC."
 
 
@@ -189,6 +201,21 @@ def test_client_attributes_include_device_classification() -> None:
     assert attrs["Day Zero Classification"] == "APPLE, INC."
     assert attrs["Device Vendor"] == "Apple"
     assert attrs["Device Protocol"] == "DHCP"
+
+
+def test_client_attributes_include_verified_device_name() -> None:
+    mac = "aa:bb:cc:dd:ee:ff"
+    client = _make_client(
+        mac,
+        {
+            "device-name": "Haffi iPhone",
+            CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+        },
+    )
+
+    attrs = client.extra_state_attributes
+
+    assert attrs["Device Name"] == "Haffi iPhone"
 
 
 def test_client_name_falls_back_to_generic_label() -> None:

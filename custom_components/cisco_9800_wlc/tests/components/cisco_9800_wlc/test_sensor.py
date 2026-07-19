@@ -27,6 +27,10 @@ from custom_components.cisco_9800_wlc.sensor import (
     CiscoWLCClientCurrentAPSensor,
     async_setup_entry as async_setup_sensor_entry,
 )
+from custom_components.cisco_9800_wlc.utils import (
+    CLIENT_NAME_VERIFIED_FIELD,
+    CLIENT_NAME_VERIFIED_VALUE,
+)
 
 AP_MAC = "34:5d:a8:0a:2e:40"
 AIR_QUALITY_LAST_UPDATE = "2026-07-19T09:12:49.248687+00:00"
@@ -368,6 +372,7 @@ async def test_client_current_ap_sensor_native_value_tracks_ap_name(hass) -> Non
             "connected": True,
             "ap-name": "HHO-1haed-9166",
             "device-name": "blackey-iphone",
+            CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
         }
     }
 
@@ -434,7 +439,7 @@ async def test_client_current_ap_sensor_uses_default_without_real_name(hass) -> 
     assert sensor.device_info["name"] == "Client 97:8f"
 
 
-async def test_client_current_ap_sensor_uses_any_non_placeholder_device_name(
+async def test_client_current_ap_sensor_ignores_stale_classification_device_name(
     hass,
 ) -> None:
     entry = _config_entry("entry_client_ap_vendor_name")
@@ -444,6 +449,7 @@ async def test_client_current_ap_sensor_uses_any_non_placeholder_device_name(
             "connected": True,
             "ap-name": "HHO-1haed-9166",
             "device-name": "APPLE, INC.",
+            CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
             "device-type": "Apple-Device",
             "device-os": "iPhone16,2",
             "day-zero-dc": "APPLE, INC.",
@@ -456,7 +462,7 @@ async def test_client_current_ap_sensor_uses_any_non_placeholder_device_name(
         "80:b9:89:7b:62:2d",
     )
 
-    assert sensor.device_info["name"] == "APPLE, INC. 62:2d"
+    assert sensor.device_info["name"] == "Client 62:2d"
 
 
 async def test_client_current_ap_sensor_does_not_use_ssid_for_unclassified(

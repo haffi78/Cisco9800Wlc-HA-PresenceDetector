@@ -263,8 +263,40 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
         device = device_registry.async_get_device(
             identifiers={(DOMAIN, self._device_identifier())}
         )
-        if device and device.name != desired_name:
+        if not device:
+            _LOGGER.debug(
+                "Client device registry for %s not found while applying name=%r",
+                self.mac,
+                desired_name,
+            )
+            return
+
+        current_name = getattr(device, "name", None)
+        name_by_user = getattr(device, "name_by_user", None)
+        _LOGGER.debug(
+            "Client device registry for %s has name=%r name_by_user=%r; "
+            "desired integration name=%r",
+            self.mac,
+            current_name,
+            name_by_user,
+            desired_name,
+        )
+
+        if name_by_user:
+            _LOGGER.debug(
+                "Client device registry for %s keeps user-defined name=%r",
+                self.mac,
+                name_by_user,
+            )
+            return
+
+        if current_name != desired_name:
             device_registry.async_update_device(device.id, name=desired_name)
+            _LOGGER.debug(
+                "Client device registry for %s updated integration name to %r",
+                self.mac,
+                desired_name,
+            )
 
     def _handle_coordinator_update(self) -> None:
         self._attr_name = None

@@ -20,10 +20,15 @@ from .const import (
     DEFAULT_AP_DETAIL_INTERVAL,
 )
 from .utils import (
+    CLIENT_NAME_VERIFIED_FIELD,
+    CLIENT_NAME_VERIFIED_VALUE,
     PLACEHOLDER_CLIENT_LABELS,
     build_https_url,
+    cisco_device_name,
     client_mac_from_unique_id,
+    meaningful_client_label,
     real_client_name,
+    same_client_label,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -59,6 +64,7 @@ CLIENT_ALWAYS_REPLACE_FIELDS = {
     "attributes_updated",
 }
 CLIENT_DETAIL_FIELDS = {
+    CLIENT_NAME_VERIFIED_FIELD,
     "ap-name",
     "username",
     "ssid",
@@ -526,6 +532,19 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 if not isinstance(self.data, dict):
                     self.data = {}
                 self.data.update(data)
+                for mac, attributes in data.items():
+                    if not isinstance(mac, str) or not isinstance(attributes, dict):
+                        continue
+                    marker = attributes.get(CLIENT_NAME_VERIFIED_FIELD)
+                    if marker is not None and marker != CLIENT_NAME_VERIFIED_VALUE:
+                        _LOGGER.debug(
+                            "Cached client identity for %s has stale "
+                            "verification marker=%r device-name=%r; will "
+                            "refresh dc-info",
+                            mac,
+                            marker,
+                            attributes.get("device-name"),
+                        )
                 cached_macs = {
                     mac
                     for mac, attributes in data.items()
@@ -607,7 +626,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                         self._enrich_attempts[mac] = attempts
                         if mac in self._identity_enrich_exhausted:
                             _LOGGER.debug(
-                                "One-shot enrich for %s returned a placeholder "
+                                "One-shot enrich for %s returned a non-final "
                                 "device name often enough to stop retries",
                                 mac,
                             )
@@ -703,13 +722,11 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         self.hass.loop.create_task(_delayed_enqueue())
 
     def _record_identity_name_observation(self, mac: str, value: Any) -> None:
-        """Track whether Cisco repeatedly reports a placeholder device name."""
+        """Track whether Cisco repeatedly reports a non-final device name."""
 
         device_name = value.get("device-name") if isinstance(value, dict) else value
-        if real_client_name(value) or (
-            not isinstance(value, dict)
-            and _is_meaningful(device_name)
-            and not _is_placeholder_client_label(device_name)
+        if cisco_device_name(value) or (
+            not isinstance(value, dict) and meaningful_client_label(device_name)
         ):
             self._identity_name_observations.pop(mac, None)
             self._identity_enrich_exhausted.discard(mac)
@@ -729,7 +746,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
             self._enrich_attempts.pop(mac, None)
             _LOGGER.debug(
                 "Stopping identity retries for %s after Cisco reported a "
-                "placeholder device name %d time(s) in the last %d check(s)",
+                "non-final device name %d time(s) in the last %d check(s)",
                 mac,
                 sum(observations),
                 len(observations),
@@ -1026,6 +1043,28 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     ", ".join(sorted(active_macs_raw)),
                 )
 
+            previous_clients = self.data if isinstance(self.data, dict) else {}
+            reconnected_unnamed_macs = {
+                mac
+                for mac in active_macs_raw
+                if (
+                    isinstance(previous_clients.get(mac), dict)
+                    and previous_clients[mac].get("connected") is False
+                    and _needs_client_name_refresh(previous_clients[mac])
+                )
+            }
+            if reconnected_unnamed_macs:
+                for mac in reconnected_unnamed_macs:
+                    self._identity_enrich_exhausted.discard(mac)
+                    self._enrich_attempts.pop(mac, None)
+                    self._identity_name_observations.pop(mac, None)
+                _LOGGER.debug(
+                    "Reset identity retry state for %d reconnected unnamed "
+                    "client(s): %s",
+                    len(reconnected_unnamed_macs),
+                    ", ".join(sorted(reconnected_unnamed_macs)),
+                )
+
             #  Get all registered MACs (includes disabled entries) in normalized form
             registered_macs = self.get_registered_macs()
             #  Detailed polling is explicitly selected in the options UI.
@@ -1112,7 +1151,10 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     len(detailed_and_active_list),
                     ", ".join(detailed_and_active_list),
                 )
-            tasks = [self.fetch_attributes(mac) for mac in detailed_and_active_list]
+            tasks = [
+                self.fetch_attributes(mac, refresh_identity=True)
+                for mac in detailed_and_active_list
+            ]
 
             attribute_results = []
             batch_size = 3
@@ -2073,7 +2115,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         return self._normalize_mac(client_mac_from_unique_id(unique_id))
 ############################################################################################################
 
-    async def fetch_attributes(self, mac):
+    async def fetch_attributes(self, mac, *, refresh_identity: bool = False):
         """Fetch multiple attributes for a tracked MAC address from Cisco WLC, handling API limits."""
         async with self.api_semaphore:  # Prevents API flooding (Max concurrent requests)
             encoded_mac = quote(mac, safe="")  # Properly encode the MAC address
@@ -2102,7 +2144,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 "roaming_history": _client_url("roaming_history"),
             }
 
-            if not has_dc_info:
+            if refresh_identity or not has_dc_info:
                 url_mapping["device"] = _client_url("device")
 
             await asyncio.sleep(0.1)  # Small delay to avoid API rate limits
@@ -2196,12 +2238,56 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                     elif key == "device":
                         # Only include device fields if present; avoid overriding with None/Unknown
                         dn = items.get("device-name")
+                        identity_context = dict(existing) if isinstance(existing, dict) else {}
+                        identity_context.update(items)
                         if "device-name" in items:
-                            self._record_identity_name_observation(mac, items)
-                        if real_client_name(items):
-                            attributes["device-name"] = dn
+                            self._record_identity_name_observation(mac, identity_context)
+                        device_name = (
+                            cisco_device_name(identity_context)
+                            if "device-name" in items
+                            else None
+                        )
+                        existing_device_name = real_client_name(existing)
+                        if (
+                            device_name
+                            and existing_device_name
+                            and not same_client_label(device_name, existing_device_name)
+                            and meaningful_client_label(
+                                identity_context.get("day-zero-dc")
+                            )
+                            is None
+                        ):
+                            _LOGGER.debug(
+                                "Client identity for %s ignored replacement "
+                                "dc-info.device-name=%r because existing "
+                                "verified device-name=%r has no day-zero "
+                                "context for comparison",
+                                mac,
+                                device_name,
+                                existing_device_name,
+                            )
+                            device_name = None
+                        if device_name:
+                            attributes["device-name"] = device_name
+                            attributes[
+                                CLIENT_NAME_VERIFIED_FIELD
+                            ] = CLIENT_NAME_VERIFIED_VALUE
                             self._identity_enrich_exhausted.discard(mac)
                             received_meaningful = True
+                        elif "device-name" in items:
+                            _LOGGER.debug(
+                                "Client identity for %s ignored non-final "
+                                "dc-info.device-name=%r",
+                                mac,
+                                dn,
+                            )
+                        else:
+                            _LOGGER.debug(
+                                "Client identity for %s dc-info response did "
+                                "not include device-name; keys=%s",
+                                mac,
+                                sorted(items.keys()),
+                            )
                         dt = items.get("device-type")
                         if _is_meaningful(dt):
                             attributes["device-type"] = dt

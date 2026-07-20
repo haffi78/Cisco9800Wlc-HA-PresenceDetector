@@ -110,6 +110,25 @@ def build_client_device_identifier(controller_identifier: str, mac: str) -> str:
     )
 
 
+def build_ap_device_identifier(controller_identifier: str, mac: str) -> str:
+    """Return a WLC-scoped device registry identifier for an AP."""
+
+    return (
+        f"{normalize_controller_identifier(controller_identifier)}"
+        f"{CLIENT_UNIQUE_ID_SEPARATOR}ap"
+        f"{CLIENT_UNIQUE_ID_SEPARATOR}{str(mac or '').strip().lower()}"
+    )
+
+
+def build_ap_unique_id(controller_identifier: str, mac: str, key: str) -> str:
+    """Return a WLC-scoped unique ID for an AP entity."""
+
+    return (
+        f"{build_ap_device_identifier(controller_identifier, mac)}"
+        f"{CLIENT_UNIQUE_ID_SEPARATOR}{str(key or '').strip().lower()}"
+    )
+
+
 def client_mac_from_unique_id(unique_id: str) -> str:
     """Return the MAC-looking tail from a client unique ID."""
 

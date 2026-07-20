@@ -396,14 +396,22 @@ merges fresh environmental telemetry into the cached AP records.
 
 AP entities are implemented mostly in `sensor.py` and `button.py`.
 
-All AP entities use the same Home Assistant device identifier:
+All AP entities for one controller use the same Home Assistant device
+identifier:
 
 ```text
-(DOMAIN, f"ap-{ap_mac}")
+(DOMAIN, f"{controller_host}_ap_{ap_mac}")
 ```
 
 That keeps AP status sensors, AP metric sensors, environmental sensors, and AP
-LED buttons grouped under the same AP device.
+LED buttons grouped under the same AP device for the reporting controller. AP
+device identifiers and AP entity unique IDs must stay controller-scoped, and AP
+`DeviceInfo` must not publish `CONNECTION_NETWORK_MAC`; Home Assistant treats
+MAC connections as global device identity and can merge APs across WLC entries.
+Legacy MAC-only AP sensor and button unique IDs are migrated to scoped IDs when
+possible. Empty legacy AP devices left behind by this re-home are removed after
+their entities move to the scoped AP device. The AP MAC remains available as
+AP sensor attribute `ap_mac` and device `serial_number` metadata.
 
 AP sensors include:
 
@@ -415,6 +423,15 @@ AP sensors include:
 - Per-radio channel.
 - Per-radio channel width.
 - Per-radio TX power.
+- CDP Device ID.
+- CDP Neighbor Port.
+- CDP Platform.
+- CDP Neighbor IP.
+- CDP Last Update.
+- LLDP Neighbor MAC.
+- LLDP Port ID.
+- LLDP System Name.
+- LLDP Management Address.
 - Temperature.
 - Humidity.
 - Air quality index.
@@ -428,7 +445,8 @@ do not create standalone Home Assistant entities.
 AP numeric sensors only return native `int` or `float` values. This is deliberate
 so Home Assistant statistics and display precision behave correctly.
 
-AP status sensor attributes include CDP and LLDP neighbor data when available.
+CDP and LLDP neighbor details are exposed as diagnostic string sensors under
+the AP device rather than attributes on the AP status sensor.
 
 ## AP LED Controls
 
@@ -530,6 +548,10 @@ Before any fixture is shared or committed, sanitize it.
 - Keep client tracker unique IDs controller-scoped. MAC-only unique IDs collide
   when multiple WLCs see the same device.
 
+- Keep AP entity unique IDs and AP device identifiers controller-scoped. Avoid
+  AP `CONNECTION_NETWORK_MAC` device connections because HA treats those as
+  global identity and can attach AP entities to another WLC entry.
+
 - Keep registry lookups scoped by `config_entry_id`. Without this, multiple WLC
   entries can see and mutate each other's entities.
 
@@ -575,7 +597,7 @@ When adding AP metrics:
    `_async_fetch_ap_environment()`.
 2. Store numeric values as `int` or `float`, not strings.
 3. Add a sensor description in `sensor.py`.
-4. Ensure the entity groups under `(DOMAIN, f"ap-{ap_mac}")`.
+4. Ensure the entity groups under `(DOMAIN, f"{controller_host}_ap_{ap_mac}")`.
 5. Add tests in `test_sensor.py` and fixture-backed coordinator tests if useful.
 
 When adding options:

@@ -7,6 +7,7 @@ import logging
 from typing import Any, cast
 
 from homeassistant.components.sensor import (
+    DOMAIN as SENSOR_DOMAIN,
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
@@ -19,13 +20,16 @@ from homeassistant.const import (
     UnitOfTemperature,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
-from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import CiscoWLCUpdateCoordinator
+from .registry import async_cleanup_legacy_empty_ap_devices
 from .utils import (
+    build_ap_device_identifier,
+    build_ap_unique_id,
     best_client_label,
     build_client_device_identifier,
     build_client_unique_id,
@@ -94,6 +98,14 @@ class CiscoWLCAPDeviceSensorDescription(SensorEntityDescription):
 class CiscoWLCAPRadioSensorDescription(SensorEntityDescription):
     """Describes a per-radio metric."""
 
+    value_field: str = ""
+
+
+@dataclass
+class CiscoWLCAPNeighborSensorDescription(SensorEntityDescription):
+    """Describes an AP CDP/LLDP neighbor detail."""
+
+    source_field: str = ""
     value_field: str = ""
 
 
@@ -231,6 +243,82 @@ AP_STATUS_SENSOR_DESCRIPTION = SensorEntityDescription(
     name="AP Online Status",
     icon="mdi:access-point-network",
     entity_category=EntityCategory.DIAGNOSTIC,
+)
+
+
+AP_NEIGHBOR_SENSOR_DESCRIPTIONS: tuple[CiscoWLCAPNeighborSensorDescription, ...] = (
+    CiscoWLCAPNeighborSensorDescription(
+        key="ap_cdp_device_id",
+        name="CDP Device ID",
+        icon="mdi:lan-connect",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        source_field="cdp",
+        value_field="device_id",
+    ),
+    CiscoWLCAPNeighborSensorDescription(
+        key="ap_cdp_neighbor_port",
+        name="CDP Neighbor Port",
+        icon="mdi:ethernet",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        source_field="cdp",
+        value_field="neighbor_port",
+    ),
+    CiscoWLCAPNeighborSensorDescription(
+        key="ap_cdp_platform",
+        name="CDP Platform",
+        icon="mdi:router-network",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        source_field="cdp",
+        value_field="platform",
+    ),
+    CiscoWLCAPNeighborSensorDescription(
+        key="ap_cdp_neighbor_ip",
+        name="CDP Neighbor IP",
+        icon="mdi:ip-network",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        source_field="cdp",
+        value_field="neighbor_ip",
+    ),
+    CiscoWLCAPNeighborSensorDescription(
+        key="ap_cdp_last_update",
+        name="CDP Last Update",
+        icon="mdi:clock-outline",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        source_field="cdp",
+        value_field="last_update",
+    ),
+    CiscoWLCAPNeighborSensorDescription(
+        key="ap_lldp_neighbor_mac",
+        name="LLDP Neighbor MAC",
+        icon="mdi:lan-connect",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        source_field="lldp",
+        value_field="neighbor_mac",
+    ),
+    CiscoWLCAPNeighborSensorDescription(
+        key="ap_lldp_port_id",
+        name="LLDP Port ID",
+        icon="mdi:ethernet",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        source_field="lldp",
+        value_field="port_id",
+    ),
+    CiscoWLCAPNeighborSensorDescription(
+        key="ap_lldp_system_name",
+        name="LLDP System Name",
+        icon="mdi:router-network",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        source_field="lldp",
+        value_field="system_name",
+    ),
+    CiscoWLCAPNeighborSensorDescription(
+        key="ap_lldp_management_address",
+        name="LLDP Management Address",
+        icon="mdi:ip-network",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        source_field="lldp",
+        value_field="management_address",
+    ),
 )
 
 
@@ -433,7 +521,11 @@ class CiscoWLCAPEnvironmentSensor(
         self._ap_mac = ap_mac
         self.entity_description = description
         self._attr_name = description.name
-        self._attr_unique_id = f"{ap_mac}_{description.key}"
+        self._attr_unique_id = build_ap_unique_id(
+            coordinator.host,
+            ap_mac,
+            description.key,
+        )
 
     def _ap_record(self) -> dict:
         data = self.coordinator.data if isinstance(self.coordinator.data, dict) else {}
@@ -475,7 +567,7 @@ class CiscoWLCAPEnvironmentSensor(
     @property
     def extra_state_attributes(self) -> dict:
         record = self._ap_record()
-        attrs: dict[str, str | float] = {}
+        attrs: dict[str, str | float] = {"ap_mac": self._ap_mac}
         last_update_field = self.entity_description.last_update_field
         if last_update_field and record.get(last_update_field):
             attrs["last_update"] = record[last_update_field]
@@ -493,12 +585,17 @@ class CiscoWLCAPEnvironmentSensor(
         if isinstance(ip_address, str) and ip_address:
             config_url = build_https_url(ip_address)
         return DeviceInfo(
-            identifiers={(DOMAIN, f"ap-{self._ap_mac}")},
+            identifiers={
+                (
+                    DOMAIN,
+                    build_ap_device_identifier(self.coordinator.host, self._ap_mac),
+                )
+            },
             name=self._display_name(),
             manufacturer="Cisco",
             model=record.get("model"),
+            serial_number=record.get("serial_number") or self._ap_mac,
             suggested_area=record.get("location"),
-            connections={(dr.CONNECTION_NETWORK_MAC, self._ap_mac)},
             configuration_url=config_url,
             via_device=(DOMAIN, self._entry.entry_id),
         )
@@ -524,7 +621,11 @@ class CiscoWLCAPDeviceSensor(
         self._ap_mac = ap_mac
         self.entity_description = description
         self._attr_name = description.name
-        self._attr_unique_id = f"{ap_mac}_{description.key}"
+        self._attr_unique_id = build_ap_unique_id(
+            coordinator.host,
+            ap_mac,
+            description.key,
+        )
 
     def _ap_record(self) -> dict:
         data = self.coordinator.data if isinstance(self.coordinator.data, dict) else {}
@@ -547,7 +648,7 @@ class CiscoWLCAPDeviceSensor(
     @property
     def extra_state_attributes(self) -> dict:
         record = self._ap_record()
-        attrs: dict[str, Any] = {}
+        attrs: dict[str, Any] = {"ap_mac": self._ap_mac}
         for key in ("ip_address", "location", "mode", "admin_state", "oper_state"):
             if record.get(key) is not None:
                 attrs[key] = record[key]
@@ -559,12 +660,17 @@ class CiscoWLCAPDeviceSensor(
     def device_info(self) -> DeviceInfo:
         record = self._ap_record()
         return DeviceInfo(
-            identifiers={(DOMAIN, f"ap-{self._ap_mac}")},
+            identifiers={
+                (
+                    DOMAIN,
+                    build_ap_device_identifier(self.coordinator.host, self._ap_mac),
+                )
+            },
             name=self._display_name(),
             manufacturer="Cisco",
             model=record.get("model"),
+            serial_number=record.get("serial_number") or self._ap_mac,
             suggested_area=record.get("location"),
-            connections={(dr.CONNECTION_NETWORK_MAC, self._ap_mac)},
             via_device=(DOMAIN, self._entry.entry_id),
         )
 
@@ -588,7 +694,11 @@ class CiscoWLCAPStatusSensor(
         self._ap_mac = ap_mac
         self.entity_description = AP_STATUS_SENSOR_DESCRIPTION
         self._attr_name = AP_STATUS_SENSOR_DESCRIPTION.name
-        self._attr_unique_id = f"{ap_mac}_{self.entity_description.key}"
+        self._attr_unique_id = build_ap_unique_id(
+            coordinator.host,
+            ap_mac,
+            self.entity_description.key,
+        )
 
     def _ap_record(self) -> dict:
         data = self.coordinator.data if isinstance(self.coordinator.data, dict) else {}
@@ -626,32 +736,7 @@ class CiscoWLCAPStatusSensor(
     @property
     def extra_state_attributes(self) -> dict:
         record = self._ap_record()
-        attrs: dict[str, Any] = {}
-        cdp = record.get("cdp")
-        if isinstance(cdp, dict):
-            mapping = [
-                ("device_id", "cdp_device_id"),
-                ("neighbor_port", "cdp_neighbor_port"),
-                ("platform", "cdp_platform"),
-                ("neighbor_ip", "cdp_neighbor_ip"),
-                ("last_update", "cdp_last_update"),
-            ]
-            for src, dest in mapping:
-                value = cdp.get(src)
-                if value is not None:
-                    attrs[dest] = value
-        lldp = record.get("lldp")
-        if isinstance(lldp, dict):
-            lldp_mapping = [
-                ("neighbor_mac", "lldp_neighbor_mac"),
-                ("port_id", "lldp_port_id"),
-                ("system_name", "lldp_system_name"),
-                ("management_address", "lldp_management_address"),
-            ]
-            for src, dest in lldp_mapping:
-                value = lldp.get(src)
-                if value is not None:
-                    attrs[dest] = value
+        attrs: dict[str, Any] = {"ap_mac": self._ap_mac}
         if record.get("last_seen"):
             attrs["last_seen"] = record["last_seen"]
         return attrs
@@ -664,12 +749,92 @@ class CiscoWLCAPStatusSensor(
         if isinstance(ip_address, str) and ip_address:
             config_url = build_https_url(ip_address)
         return DeviceInfo(
-            identifiers={(DOMAIN, f"ap-{self._ap_mac}")},
+            identifiers={
+                (
+                    DOMAIN,
+                    build_ap_device_identifier(self.coordinator.host, self._ap_mac),
+                )
+            },
             name=_format_ap_display_name(record.get("name"), self._ap_mac),
             manufacturer="Cisco",
             model=record.get("model"),
+            serial_number=record.get("serial_number") or self._ap_mac,
             suggested_area=record.get("location"),
-            connections={(dr.CONNECTION_NETWORK_MAC, self._ap_mac)},
+            configuration_url=config_url,
+            via_device=(DOMAIN, self._entry.entry_id),
+        )
+
+
+class CiscoWLCAPNeighborSensor(
+    CoordinatorEntity[CiscoWLCUpdateCoordinator], SensorEntity
+):
+    """Represents an AP CDP/LLDP neighbor detail as a string sensor."""
+
+    _attr_should_poll = False
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        coordinator: CiscoWLCUpdateCoordinator,
+        config_entry: ConfigEntry,
+        ap_mac: str,
+        description: CiscoWLCAPNeighborSensorDescription,
+    ) -> None:
+        super().__init__(coordinator)
+        self._entry = config_entry
+        self._ap_mac = ap_mac
+        self.entity_description = description
+        self._attr_name = description.name
+        self._attr_unique_id = build_ap_unique_id(
+            coordinator.host,
+            ap_mac,
+            description.key,
+        )
+
+    def _ap_record(self) -> dict:
+        data = self.coordinator.data if isinstance(self.coordinator.data, dict) else {}
+        devices = data.get("ap_devices") if isinstance(data, dict) else {}
+        if not isinstance(devices, dict):
+            return {}
+        record = devices.get(self._ap_mac)
+        return record if isinstance(record, dict) else {}
+
+    @property
+    def native_value(self) -> str | None:
+        source = self._ap_record().get(self.entity_description.source_field)
+        if not isinstance(source, dict):
+            return None
+        value = source.get(self.entity_description.value_field)
+        if value is None:
+            return None
+        return str(value)
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {
+            "ap_mac": self._ap_mac,
+            "protocol": self.entity_description.source_field.upper(),
+        }
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        record = self._ap_record()
+        ip_address = record.get("ip_address")
+        config_url = None
+        if isinstance(ip_address, str) and ip_address:
+            config_url = build_https_url(ip_address)
+        return DeviceInfo(
+            identifiers={
+                (
+                    DOMAIN,
+                    build_ap_device_identifier(self.coordinator.host, self._ap_mac),
+                )
+            },
+            name=_format_ap_display_name(record.get("name"), self._ap_mac),
+            manufacturer="Cisco",
+            model=record.get("model"),
+            serial_number=record.get("serial_number") or self._ap_mac,
+            suggested_area=record.get("location"),
             configuration_url=config_url,
             via_device=(DOMAIN, self._entry.entry_id),
         )
@@ -698,7 +863,11 @@ class CiscoWLCAPRadioSensor(
         self.entity_description = description
         base_name = description.name or description.key.replace("_", " ").title()
         self._attr_name = f"{base_name} (Slot {slot})"
-        self._attr_unique_id = f"{ap_mac}_{description.key}_slot{slot}"
+        self._attr_unique_id = build_ap_unique_id(
+            coordinator.host,
+            ap_mac,
+            f"{description.key}_slot{slot}",
+        )
 
     def _radio_record(self) -> tuple[dict, dict]:
         data = self.coordinator.data if isinstance(self.coordinator.data, dict) else {}
@@ -732,7 +901,10 @@ class CiscoWLCAPRadioSensor(
     @property
     def extra_state_attributes(self) -> dict:
         ap_record, radio = self._radio_record()
-        attrs: dict[str, str | float] = {"slot": self._slot}
+        attrs: dict[str, str | float] = {
+            "ap_mac": self._ap_mac,
+            "slot": self._slot,
+        }
         for key in ("band", "radio_type", "admin_state", "oper_state", "channel_width_cap"):
             if radio.get(key) is not None:
                 attrs[key] = radio[key]
@@ -749,15 +921,99 @@ class CiscoWLCAPRadioSensor(
         if isinstance(ip_address, str) and ip_address:
             config_url = build_https_url(ip_address)
         return DeviceInfo(
-            identifiers={(DOMAIN, f"ap-{self._ap_mac}")},
+            identifiers={
+                (
+                    DOMAIN,
+                    build_ap_device_identifier(self.coordinator.host, self._ap_mac),
+                )
+            },
             name=friendly,
             manufacturer="Cisco",
             model=ap_record.get("model"),
+            serial_number=ap_record.get("serial_number") or self._ap_mac,
             suggested_area=ap_record.get("location"),
-            connections={(dr.CONNECTION_NETWORK_MAC, self._ap_mac)},
             configuration_url=config_url,
             via_device=(DOMAIN, self._entry.entry_id),
         )
+
+
+def _ap_sensor_unique_id_migrations(
+    coordinator: CiscoWLCUpdateCoordinator,
+) -> dict[str, str]:
+    """Return legacy AP sensor unique IDs mapped to WLC-scoped IDs."""
+
+    data = coordinator.data if isinstance(coordinator.data, dict) else {}
+    env_data = data.get("ap_sensors") if isinstance(data, dict) else {}
+    device_data = data.get("ap_devices") if isinstance(data, dict) else {}
+    migrations: dict[str, str] = {}
+    ap_macs: set[str] = set()
+
+    def _add(mac: str, key: str) -> None:
+        legacy_uid = f"{mac}_{key}".lower()
+        migrations[legacy_uid] = build_ap_unique_id(coordinator.host, mac, key)
+
+    if isinstance(env_data, dict):
+        ap_macs.update(mac for mac in env_data if isinstance(mac, str))
+
+    if isinstance(device_data, dict):
+        ap_macs.update(mac for mac in device_data if isinstance(mac, str))
+
+    for mac in ap_macs:
+        for description in AP_ENVIRONMENT_SENSOR_DESCRIPTIONS:
+            _add(mac, description.key)
+        _add(mac, AP_STATUS_SENSOR_DESCRIPTION.key)
+        for description in AP_DEVICE_SENSOR_DESCRIPTIONS:
+            _add(mac, description.key)
+        for description in AP_NEIGHBOR_SENSOR_DESCRIPTIONS:
+            _add(mac, description.key)
+
+    if isinstance(device_data, dict):
+        for mac, info in device_data.items():
+            if not isinstance(mac, str) or not isinstance(info, dict):
+                continue
+            radios = info.get("radios")
+            if not isinstance(radios, dict):
+                continue
+            for slot, slot_info in radios.items():
+                if not isinstance(slot_info, dict):
+                    continue
+                for description in AP_RADIO_SENSOR_DESCRIPTIONS:
+                    _add(mac, f"{description.key}_slot{slot}")
+
+    return migrations
+
+
+def _async_migrate_ap_sensor_unique_ids(
+    hass: HomeAssistant,
+    coordinator: CiscoWLCUpdateCoordinator,
+    entry: ConfigEntry,
+) -> None:
+    """Move legacy MAC-only AP sensor unique IDs to WLC-scoped unique IDs."""
+
+    migrations = _ap_sensor_unique_id_migrations(coordinator)
+    if not migrations:
+        return
+
+    entity_registry = er.async_get(hass)
+    for entity_entry in list(entity_registry.entities.values()):
+        if (
+            entity_entry.platform != DOMAIN
+            or entity_entry.config_entry_id != entry.entry_id
+            or not entity_entry.entity_id.startswith(f"{SENSOR_DOMAIN}.")
+            or not entity_entry.unique_id
+        ):
+            continue
+        uid = entity_entry.unique_id.lower()
+        scoped_uid = migrations.get(uid)
+        if not scoped_uid or uid == scoped_uid:
+            continue
+        if entity_registry.async_get_entity_id(SENSOR_DOMAIN, DOMAIN, scoped_uid):
+            continue
+        entity_registry.async_update_entity(
+            entity_entry.entity_id,
+            new_unique_id=scoped_uid,
+        )
+
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities
@@ -770,10 +1026,17 @@ async def async_setup_entry(
         )
         return
 
+    _async_migrate_ap_sensor_unique_ids(hass, coordinator, entry)
+
     entities: list[SensorEntity] = [CiscoWLCVersionSensor(coordinator, entry)]
     async_add_entities(entities)
 
     known_sensors: set[tuple[str, str, int | None]] = set()
+
+    def _schedule_legacy_ap_cleanup() -> None:
+        hass.async_create_task(
+            async_cleanup_legacy_empty_ap_devices(hass, coordinator, entry)
+        )
 
     @callback
     def _async_add_dynamic_entities() -> None:
@@ -853,6 +1116,26 @@ async def async_setup_entry(
                 )
                 known_sensors.add(key)
 
+            for description in AP_NEIGHBOR_SENSOR_DESCRIPTIONS:
+                source = info.get(description.source_field)
+                if (
+                    not isinstance(source, dict)
+                    or source.get(description.value_field) is None
+                ):
+                    continue
+                key = (mac, description.key, None)
+                if key in known_sensors:
+                    continue
+                new_entities.append(
+                    CiscoWLCAPNeighborSensor(
+                        coordinator,
+                        entry,
+                        mac,
+                        description,
+                    )
+                )
+                known_sensors.add(key)
+
             radios = info.get("radios")
             if isinstance(radios, dict):
                 for slot, slot_info in radios.items():
@@ -881,6 +1164,7 @@ async def async_setup_entry(
 
         if new_entities:
             async_add_entities(new_entities)
+        _schedule_legacy_ap_cleanup()
 
     _async_add_dynamic_entities()
     coordinator.async_add_listener(_async_add_dynamic_entities)

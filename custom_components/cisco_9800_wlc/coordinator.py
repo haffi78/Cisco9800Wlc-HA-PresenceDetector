@@ -30,7 +30,7 @@ from .utils import (
     real_client_name,
     same_client_label,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.const import CONF_HOST, CONF_USERNAME, CONF_PASSWORD
@@ -47,6 +47,7 @@ DEBUG_LOG_PAYLOADS = False  # set True temporarily when inspecting raw payloads
 DEBUG_PAYLOAD_MAX_CHARS = 10000  # truncate long payloads in debug logs
 ENRICH_RETRY_LIMIT = 3
 ENRICH_DELAY_SECONDS = 0.8
+ENRICH_NOTIFICATION_DELAY_SECONDS = 2.0
 INITIAL_ENRICH_DELAY_SECONDS = 4.0
 IDENTITY_ENRICH_RETRY_LIMIT = 5
 # Name data can lag client association by minutes on the WLC.
@@ -384,6 +385,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
     def __init__(self, hass: HomeAssistant, config: dict, entry_id: str, options: dict | None = None):
         self.entry_id = entry_id
+        self.controller_device_id: str | None = None
         self._options = options or {}
         polling_enabled = not self._options.get("disable_polling", False)
         interval_value = self._options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL.total_seconds())
@@ -430,6 +432,7 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
         self._enrich_attempts: dict[str, int] = {}
         self._enrich_queue: asyncio.Queue[str] = asyncio.Queue()
         self._enrich_worker_task: asyncio.Task | None = None
+        self._enrich_notification_handle: asyncio.TimerHandle | None = None
         self._identity_enrich_exhausted: set[str] = set()
         self._identity_name_observations: dict[str, list[bool]] = {}
         # Version fetch cadence control
@@ -584,6 +587,9 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
 
     async def async_shutdown(self) -> None:
         """Cancel background work cleanly."""
+        if self._enrich_notification_handle is not None:
+            self._enrich_notification_handle.cancel()
+            self._enrich_notification_handle = None
         if self._enrich_worker_task and not self._enrich_worker_task.done():
             _LOGGER.debug("Cancelling enrichment worker")
             self._enrich_worker_task.cancel()
@@ -601,6 +607,23 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 pass
         self._pending_status_save = None
 
+    @callback
+    def _schedule_enrich_notification(self) -> None:
+        """Batch client detail notifications without postponing presence polls."""
+        if self._enrich_notification_handle is None:
+            self._enrich_notification_handle = self.hass.loop.call_later(
+                ENRICH_NOTIFICATION_DELAY_SECONDS,
+                self.async_update_listeners,
+            )
+
+    @callback
+    def async_update_listeners(self) -> None:
+        """Notify entities and consume any pending enrichment notification."""
+        if self._enrich_notification_handle is not None:
+            self._enrich_notification_handle.cancel()
+            self._enrich_notification_handle = None
+        super().async_update_listeners()
+
     async def _enrich_worker(self):
         """Background task to process queued one-shot enrichment requests."""
         while True:
@@ -614,8 +637,8 @@ class CiscoWLCUpdateCoordinator(DataUpdateCoordinator):
                 result = await self.fetch_attributes(mac)
                 if result:
                     status_hint = self._last_enrich_status.get(mac, 'ok')
-                    # Push updated data so entities get attributes sooner
-                    self.async_set_updated_data(self.data)
+                    # Details are already in self.data; batch entity updates.
+                    self._schedule_enrich_notification()
                     await self._async_update_client_snapshot(mac)
                     if _has_client_name(self.data.get(mac, {})):
                         self._enrich_attempts.pop(mac, None)

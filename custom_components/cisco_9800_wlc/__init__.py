@@ -12,6 +12,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 
 from .coordinator import CiscoWLCOperationError, CiscoWLCUpdateCoordinator
+from .registry import async_register_controller_device
 from .const import (
     ATTR_AP_MAC,
     ATTR_AP_NAME,
@@ -164,6 +165,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Fetch initial data
     await coordinator.async_config_entry_first_refresh()
+
+    async_register_controller_device(hass, coordinator)
 
     # Store runtime data on the entry for platform access
     entry.runtime_data = coordinator

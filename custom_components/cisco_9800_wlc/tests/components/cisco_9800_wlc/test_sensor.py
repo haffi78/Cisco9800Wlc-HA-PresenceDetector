@@ -402,11 +402,18 @@ async def test_air_quality_unique_ids_are_scoped_to_wlc_host(hass) -> None:
     )
 
 
+@patch(
+    "custom_components.cisco_9800_wlc.registry.dr.async_get_device_id_by_identifier",
+    new=object(),
+    create=True,
+)
 async def test_ap_sensor_identity_is_scoped_for_multiple_wlc_hosts(hass) -> None:
     entry_a = _config_entry("entry_a", host="wlc-a.example.com")
     entry_b = _config_entry("entry_b", host="wlc-b.example.com")
     coordinator_a = _coordinator(hass, entry_a)
     coordinator_b = _coordinator(hass, entry_b)
+    coordinator_a.controller_device_id = "controller_a"
+    coordinator_b.controller_device_id = "controller_b"
     coordinator_a.data = {
         "ap_devices": {AP_MAC: {"name": "Lab AP", "client_count": 2}}
     }
@@ -436,8 +443,10 @@ async def test_ap_sensor_identity_is_scoped_for_multiple_wlc_hosts(hass) -> None
     assert sensor_b.device_info["identifiers"] == {
         (DOMAIN, f"wlc-b.example.com_ap_{AP_MAC}")
     }
-    assert sensor_a.device_info["via_device"] == (DOMAIN, "entry_a")
-    assert sensor_b.device_info["via_device"] == (DOMAIN, "entry_b")
+    assert sensor_a.device_info["via_device_id"] == "controller_a"
+    assert "via_device" not in sensor_a.device_info
+    assert sensor_b.device_info["via_device_id"] == "controller_b"
+    assert "via_device" not in sensor_b.device_info
     assert sensor_a.device_info["serial_number"] == AP_MAC
     assert sensor_b.device_info["serial_number"] == AP_MAC
     assert "connections" not in sensor_a.device_info

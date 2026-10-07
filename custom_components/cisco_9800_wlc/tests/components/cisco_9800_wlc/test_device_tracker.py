@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.helpers import entity_registry as er
@@ -30,11 +30,80 @@ def _make_client(
         data={mac: attributes or {}},
         entry_id=entry_id,
         host=host,
+        controller_device_id=f"controller_{entry_id}",
         last_update_success=True,
     )
     client._enable_by_default = True  # type: ignore[attr-defined]
     client._attr_should_poll = False  # type: ignore[attr-defined]
     return client
+
+
+def test_unchanged_client_name_avoids_registry_work_and_background_tasks() -> None:
+    client = _make_client("aa:bb:cc:dd:ee:ff")
+    client.device_entry = SimpleNamespace(
+        id="device", name="Client ee:ff", name_by_user=None
+    )
+    client.hass = SimpleNamespace(async_create_task=Mock())
+    with (
+        patch("custom_components.cisco_9800_wlc.device_tracker.dr.async_get") as registry,
+        patch("custom_components.cisco_9800_wlc.device_tracker.CoordinatorEntity._handle_coordinator_update") as state_update,
+    ):
+        client._handle_coordinator_update()
+        client._handle_coordinator_update()
+    assert state_update.call_count == 2
+    registry.assert_not_called()
+    client.hass.async_create_task.assert_not_called()
+
+
+def test_enriched_client_name_updates_registry_without_background_task() -> None:
+    client = _make_client("aa:bb:cc:dd:ee:ff", {
+        "device-name": "Kitchen Phone",
+        CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+    })
+    client.device_entry = SimpleNamespace(
+        id="device", name="Client ee:ff", name_by_user=None
+    )
+    client.hass = SimpleNamespace(async_create_task=Mock())
+    with (
+        patch("custom_components.cisco_9800_wlc.device_tracker.dr.async_get") as registry,
+        patch("custom_components.cisco_9800_wlc.device_tracker.CoordinatorEntity._handle_coordinator_update") as state_update,
+    ):
+        client._handle_coordinator_update()
+    state_update.assert_called_once()
+    registry.return_value.async_update_device.assert_called_once_with(
+        "device", name="Kitchen Phone ee:ff"
+    )
+    client.hass.async_create_task.assert_not_called()
+
+
+def test_client_name_keeps_user_override_without_registry_lookup() -> None:
+    client = _make_client("aa:bb:cc:dd:ee:ff")
+    client.device_entry = SimpleNamespace(
+        id="device", name="Old Name", name_by_user="My Phone"
+    )
+    with patch("custom_components.cisco_9800_wlc.device_tracker.dr.async_get") as registry:
+        client._update_device_registry_name()
+    registry.assert_not_called()
+
+
+def test_client_name_lookup_fallback_still_updates_missing_device_entry() -> None:
+    client = _make_client("aa:bb:cc:dd:ee:ff")
+    client.device_entry = None
+    client.hass = SimpleNamespace()
+    device = SimpleNamespace(id="device", name="Old Name", name_by_user=None)
+    with (
+        patch("custom_components.cisco_9800_wlc.device_tracker.dr.async_get") as registry,
+        patch("custom_components.cisco_9800_wlc.device_tracker.async_get_device_by_identifier", return_value=device) as lookup,
+    ):
+        client._update_device_registry_name()
+    lookup.assert_called_once_with(
+        registry.return_value,
+        (DOMAIN, "wlc.example.com_client_aa:bb:cc:dd:ee:ff"),
+        "entry_1",
+    )
+    registry.return_value.async_update_device.assert_called_once_with(
+        "device", name="Client ee:ff"
+    )
 
 
 def test_client_name_uses_device_name_with_suffix() -> None:
@@ -246,6 +315,11 @@ def test_client_presence_tracker_is_enabled_by_default() -> None:
     assert client.entity_registry_enabled_default is True
 
 
+@patch(
+    "custom_components.cisco_9800_wlc.registry.dr.async_get_device_id_by_identifier",
+    new=object(),
+    create=True,
+)
 def test_client_device_info_is_scoped_to_wlc_entry() -> None:
     mac = "aa:bb:cc:dd:ee:ff"
     client = _make_client(mac, host="wlc-int.example.com", entry_id="entry_a")
@@ -253,7 +327,8 @@ def test_client_device_info_is_scoped_to_wlc_entry() -> None:
     assert client.device_info["identifiers"] == {
         (DOMAIN, "wlc-int.example.com_client_aa:bb:cc:dd:ee:ff")
     }
-    assert client.device_info["via_device"] == (DOMAIN, "entry_a")
+    assert client.device_info["via_device_id"] == "controller_entry_a"
+    assert "via_device" not in client.device_info
 
 
 def test_client_attributes_include_ip_versions_and_controller() -> None:

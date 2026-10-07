@@ -21,6 +21,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, SIGNAL_NEW_CLIENTS
 from .coordinator import CiscoWLCUpdateCoordinator, parse_to_local_datetime
+from .registry import async_get_device_by_identifier, controller_device_link
 from .utils import (
     best_client_label,
     build_client_device_identifier,
@@ -254,15 +255,19 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
         return DeviceInfo(
             identifiers={(DOMAIN, self._device_identifier())},
             name=self._device_registry_label(),
-            via_device=(DOMAIN, self.coordinator.entry_id),
+            **controller_device_link(self.coordinator),
         )
 
-    async def _async_update_device_registry_name(self) -> None:
+    def _update_device_registry_name(self) -> None:
+        """Update changed names using the entity's existing registry entry."""
         desired_name = self._device_registry_label()
-        device_registry = dr.async_get(self.hass)
-        device = device_registry.async_get_device(
-            identifiers={(DOMAIN, self._device_identifier())}
-        )
+        device = getattr(self, "device_entry", None)
+        if device is None:
+            device = async_get_device_by_identifier(
+                dr.async_get(self.hass),
+                (DOMAIN, self._device_identifier()),
+                self.coordinator.entry_id,
+            )
         if not device:
             _LOGGER.debug(
                 "Client device registry for %s not found while applying name=%r",
@@ -291,7 +296,7 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
             return
 
         if current_name != desired_name:
-            device_registry.async_update_device(device.id, name=desired_name)
+            dr.async_get(self.hass).async_update_device(device.id, name=desired_name)
             _LOGGER.debug(
                 "Client device registry for %s updated integration name to %r",
                 self.mac,
@@ -301,7 +306,7 @@ class CiscoWLCClient(CoordinatorEntity[CiscoWLCUpdateCoordinator], ScannerEntity
     def _handle_coordinator_update(self) -> None:
         self._attr_name = None
         super()._handle_coordinator_update()
-        self.hass.async_create_task(self._async_update_device_registry_name())
+        self._update_device_registry_name()
 # -------------------------
 #  Async Setup Entry
 # -------------------------

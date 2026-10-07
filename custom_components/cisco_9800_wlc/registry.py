@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable, Mapping
 import logging
 from typing import Any
 
@@ -12,9 +13,57 @@ from homeassistant.helpers import entity_registry as er
 
 from .const import DOMAIN
 from .coordinator import CiscoWLCUpdateCoordinator
-from .utils import build_ap_device_identifier
+from .utils import build_ap_device_identifier, build_https_url
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def async_register_controller_device(
+    hass: HomeAssistant, coordinator: CiscoWLCUpdateCoordinator
+) -> None:
+    """Create the controller before platforms register devices linked to it."""
+
+    device = dr.async_get(hass).async_get_or_create(
+        config_entry_id=coordinator.entry_id,
+        identifiers={(DOMAIN, coordinator.entry_id)},
+        name="Cisco 9800 WLC",
+        manufacturer="Cisco",
+        model="9800 Series Wireless Controller",
+        configuration_url=build_https_url(coordinator.host),
+    )
+    coordinator.controller_device_id = device.id
+
+
+def controller_device_link(coordinator: CiscoWLCUpdateCoordinator) -> dict[str, Any]:
+    """Return parent-device metadata supported by the installed HA version."""
+
+    if hasattr(dr, "async_get_device_id_by_identifier"):
+        if coordinator.controller_device_id is None:
+            return {}
+        return {"via_device_id": coordinator.controller_device_id}
+    # Older HA releases do not support via_device_id yet.
+    return {"via_device": (DOMAIN, coordinator.entry_id)}
+
+
+def async_get_device_by_identifier(
+    device_registry: dr.DeviceRegistry,
+    identifier: tuple[str, str],
+    entry_id: str,
+) -> Any:
+    """Look up a device within its config entry, with support for older HA."""
+
+    if lookup := getattr(device_registry, "async_get_device_by_identifier", None):
+        return lookup(identifier, entry_id)
+    return device_registry.async_get_device(identifiers={identifier})
+
+
+def _registered_devices(device_registry: Any) -> Iterable[Any]:
+    """Iterate modern device collections or older registry mappings."""
+
+    devices = device_registry.devices
+    if isinstance(devices, Mapping):
+        return devices.values()
+    return devices
 
 
 def _ap_macs_from_coordinator(coordinator: CiscoWLCUpdateCoordinator) -> set[str]:
@@ -33,10 +82,10 @@ def _ap_macs_from_coordinator(coordinator: CiscoWLCUpdateCoordinator) -> set[str
 def _device_belongs_to_entry(device: Any, entry: ConfigEntry) -> bool:
     """Return whether a device registry entry belongs to the config entry."""
 
-    if getattr(device, "config_entry_id", None) == entry.entry_id:
-        return True
-    config_entries = getattr(device, "config_entries", set())
-    return entry.entry_id in config_entries
+    if hasattr(device, "config_entry_id"):
+        return device.config_entry_id == entry.entry_id
+    # Only read the old multi-entry property when the new field is absent.
+    return entry.entry_id in device.config_entries
 
 
 def _device_has_entity(entity_registry: Any, device_id: str) -> bool:
@@ -58,7 +107,7 @@ def _has_scoped_ap_device(
     return any(
         _device_belongs_to_entry(device, entry)
         and scoped_identifier in getattr(device, "identifiers", set())
-        for device in device_registry.devices.values()
+        for device in _registered_devices(device_registry)
     )
 
 
@@ -90,7 +139,7 @@ async def async_cleanup_legacy_empty_ap_devices(
         if not _has_scoped_ap_device(device_registry, entry, scoped_identifier):
             continue
 
-        for device in list(device_registry.devices.values()):
+        for device in list(_registered_devices(device_registry)):
             if not _device_belongs_to_entry(device, entry):
                 continue
             identifiers = getattr(device, "identifiers", set())

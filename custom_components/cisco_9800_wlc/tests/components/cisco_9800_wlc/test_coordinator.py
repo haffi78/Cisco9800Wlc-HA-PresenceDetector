@@ -5,7 +5,7 @@ import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -16,6 +16,7 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 from tests.common import MockConfigEntry
 
 from custom_components.cisco_9800_wlc.coordinator import (
+    ENRICH_NOTIFICATION_DELAY_SECONDS,
     INITIAL_ENRICH_DELAY_SECONDS,
     CiscoWLCUpdateCoordinator,
     _has_client_detail,
@@ -31,6 +32,133 @@ from custom_components.cisco_9800_wlc.utils import (
 FIXTURE_DIR = Path(__file__).parents[2] / "fixtures" / "cisco_9800_wlc"
 AP_MAC = "34:5d:a8:0a:2e:40"
 AIR_QUALITY_LAST_UPDATE = "2026-07-19T09:12:49.248687+00:00"
+
+
+def _notification_coordinator(hass, config):
+    with patch.object(CiscoWLCUpdateCoordinator, "_start_enrich_worker"):
+        return CiscoWLCUpdateCoordinator(hass, config, "entry_notifications")
+
+
+async def test_enrichment_notifications_batch_latest_client_attributes(
+    hass, coordinator_config
+) -> None:
+    coordinator = _notification_coordinator(hass, coordinator_config)
+    coordinator.data = {"client_a": {"ssid": "Home"}, "client_b": {"ssid": "Home"}}
+    snapshots = []
+    listener = Mock(side_effect=lambda: snapshots.append(
+        {mac: dict(attrs) for mac, attrs in coordinator.data.items()}
+    ))
+    handle = Mock()
+    with patch.object(coordinator, "_schedule_refresh") as schedule_poll:
+        unsubscribe = coordinator.async_add_listener(listener)
+        schedule_poll.reset_mock()
+        with patch.object(hass.loop, "call_later", return_value=handle) as schedule:
+            coordinator.data["client_a"]["device-name"] = "Phone"
+            coordinator._schedule_enrich_notification()
+            coordinator.data["client_b"]["ap-name"] = "Lab AP"
+            coordinator._schedule_enrich_notification()
+            coordinator.data["client_a"]["current-channel"] = 36
+            coordinator._schedule_enrich_notification()
+        schedule.assert_called_once_with(
+            ENRICH_NOTIFICATION_DELAY_SECONDS, coordinator.async_update_listeners
+        )
+        listener.assert_not_called()
+        schedule.call_args.args[1]()
+        listener.assert_called_once()
+        assert snapshots[0]["client_a"]["device-name"] == "Phone"
+        assert snapshots[0]["client_a"]["current-channel"] == 36
+        assert snapshots[0]["client_b"]["ap-name"] == "Lab AP"
+        schedule_poll.assert_not_called()
+        assert coordinator._enrich_notification_handle is None
+        unsubscribe()
+
+
+async def test_presence_update_consumes_pending_enrichment_notification(
+    hass, coordinator_config
+) -> None:
+    coordinator = _notification_coordinator(hass, coordinator_config)
+    listener = Mock()
+    handle = Mock()
+    with patch.object(coordinator, "_schedule_refresh"):
+        unsubscribe = coordinator.async_add_listener(listener)
+        with patch.object(hass.loop, "call_later", return_value=handle):
+            coordinator._schedule_enrich_notification()
+        # Normal polls still notify immediately, including any enriched fields.
+        coordinator.async_update_listeners()
+        listener.assert_called_once()
+        handle.cancel.assert_called_once()
+        assert coordinator._enrich_notification_handle is None
+        unsubscribe()
+
+
+async def test_enrichment_notification_preserves_controller_availability(
+    hass, coordinator_config
+) -> None:
+    coordinator = _notification_coordinator(hass, coordinator_config)
+    coordinator.last_update_success = False
+    with patch.object(hass.loop, "call_later", return_value=Mock()) as schedule:
+        coordinator._schedule_enrich_notification()
+    schedule.call_args.args[1]()
+    assert coordinator.last_update_success is False
+
+
+async def test_shutdown_cancels_pending_enrichment_notification(
+    hass, coordinator_config
+) -> None:
+    coordinator = _notification_coordinator(hass, coordinator_config)
+    handle = Mock()
+    with patch.object(hass.loop, "call_later", return_value=handle):
+        coordinator._schedule_enrich_notification()
+    await coordinator.async_shutdown()
+    handle.cancel.assert_called_once()
+    assert coordinator._enrich_notification_handle is None
+
+
+async def test_worker_batches_details_without_resetting_presence_poll(
+    hass, coordinator_config
+) -> None:
+    coordinator = _notification_coordinator(hass, coordinator_config)
+    macs = {"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"}
+    coordinator.data = {mac: {"connected": True} for mac in macs}
+    listener = Mock()
+
+    async def fetch_details(mac):
+        attributes = {
+            "device-name": f"Phone {mac[-2:]}",
+            CLIENT_NAME_VERIFIED_FIELD: CLIENT_NAME_VERIFIED_VALUE,
+        }
+        coordinator.data[mac].update(attributes)
+        return attributes
+
+    with (
+        patch.object(coordinator, "_schedule_refresh") as schedule_poll,
+        patch.object(coordinator, "async_set_updated_data") as reset_poll,
+        patch.object(coordinator, "fetch_attributes", side_effect=fetch_details),
+        patch.object(coordinator, "_async_update_client_snapshot", new_callable=AsyncMock) as save,
+        patch("custom_components.cisco_9800_wlc.coordinator.ENRICH_DELAY_SECONDS", 0),
+    ):
+        unsubscribe = coordinator.async_add_listener(listener)
+        schedule_poll.reset_mock()
+        try:
+            with patch.object(hass.loop, "call_later", return_value=Mock()) as schedule:
+                await coordinator.async_enqueue_enrich(macs)
+                coordinator._enrich_worker_task = hass.loop.create_task(
+                    coordinator._enrich_worker()
+                )
+                await coordinator._enrich_queue.join()
+            schedule.assert_called_once()
+            listener.assert_not_called()
+            schedule.call_args.args[1]()
+            listener.assert_called_once()
+            reset_poll.assert_not_called()
+            schedule_poll.assert_not_called()
+            assert save.await_count == 2
+            for mac in macs:
+                assert coordinator.data[mac]["connected"] is True
+                assert coordinator.data[mac]["device-name"] == f"Phone {mac[-2:]}"
+        finally:
+            await coordinator.async_shutdown()
+            unsubscribe()
 
 
 def load_fixture(name: str) -> dict:

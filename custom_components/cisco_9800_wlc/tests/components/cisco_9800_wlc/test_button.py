@@ -37,11 +37,18 @@ def _coordinator(hass, entry: MockConfigEntry) -> CiscoWLCUpdateCoordinator:
         return CiscoWLCUpdateCoordinator(hass, entry.data, entry.entry_id, entry.options)
 
 
+@patch(
+    "custom_components.cisco_9800_wlc.registry.dr.async_get_device_id_by_identifier",
+    new=object(),
+    create=True,
+)
 async def test_ap_led_button_identity_is_scoped_for_multiple_wlc_hosts(hass) -> None:
     entry_a = _config_entry("entry_a", "wlc-a.example.com")
     entry_b = _config_entry("entry_b", "wlc-b.example.com")
     coordinator_a = _coordinator(hass, entry_a)
     coordinator_b = _coordinator(hass, entry_b)
+    coordinator_a.controller_device_id = "controller_a"
+    coordinator_b.controller_device_id = "controller_b"
     coordinator_a.data = {
         "ap_devices": {AP_MAC: {"name": "Lab AP", "ip_address": "192.0.2.10"}}
     }
@@ -71,8 +78,10 @@ async def test_ap_led_button_identity_is_scoped_for_multiple_wlc_hosts(hass) -> 
     assert button_b.device_info["identifiers"] == {
         (DOMAIN, f"wlc-b.example.com_ap_{AP_MAC}")
     }
-    assert button_a.device_info["via_device"] == (DOMAIN, "entry_a")
-    assert button_b.device_info["via_device"] == (DOMAIN, "entry_b")
+    assert button_a.device_info["via_device_id"] == "controller_a"
+    assert "via_device" not in button_a.device_info
+    assert button_b.device_info["via_device_id"] == "controller_b"
+    assert "via_device" not in button_b.device_info
     assert button_a.device_info["serial_number"] == AP_MAC
     assert button_b.device_info["serial_number"] == AP_MAC
     assert "connections" not in button_a.device_info

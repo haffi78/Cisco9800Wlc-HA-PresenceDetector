@@ -14,7 +14,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import CiscoWLCUpdateCoordinator
-from .registry import async_cleanup_legacy_empty_ap_devices
+from .registry import async_cleanup_legacy_empty_ap_devices, controller_device_link
 from .utils import build_ap_device_identifier, build_ap_unique_id, build_https_url
 
 _LOGGER = logging.getLogger(__name__)
@@ -188,7 +188,7 @@ class _BaseAPButton(CoordinatorEntity[CiscoWLCUpdateCoordinator], ButtonEntity):
             serial_number=record.get("serial_number") or self._ap_mac,
             suggested_area=record.get("location"),
             configuration_url=config_url,
-            via_device=(DOMAIN, self._entry.entry_id),
+            **controller_device_link(self.coordinator),
         )
 
 

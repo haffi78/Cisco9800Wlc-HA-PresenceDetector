@@ -1,6 +1,7 @@
 # Cisco 9800 WLC Home Assistant Integration
-Supported and tested all 9800 Versions post 17.12 to 17.18.3 so far.
-ipv6 is partial supported, not fully tested all features .
+Supported and tested all 9800 Versions post 17.12 to 17.18.4a so far.
+ipv6 is supported, not fully tested all features. ( But reports are good ).
+Home assistant version 2026.10.0 is tested and working
 
 ## Overview
 This custom integration brings Cisco 9800 Wireless LAN Controller data into Home Assistant. It collects connected-client telemetry, access-point metadata, environmental sensor readings, and exposes controller actions such as toggling AP LEDs. The project follows Home Assistant’s bronze-quality checklist.
